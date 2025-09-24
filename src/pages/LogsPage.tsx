@@ -128,17 +128,17 @@ const LogsPage: React.FC = () => {
     return (
       <div
         key={index}
-        className="flex items-start gap-3 py-2 px-3 hover:bg-muted/50 rounded text-sm font-mono border-l-2 border-transparent hover:border-primary/20 transition-colors"
+        className="flex items-start gap-3 py-2 px-3 hover:bg-muted/50 text-sm font-mono hover:border-l-2 hover:border-primary/20 transition-colors overflow-hidden"
       >
         <div className="flex-shrink-0 w-12 text-xs text-muted-foreground">
           {String(index + 1).padStart(3, '0')}
         </div>
         <div className="flex-shrink-0">
-          <Badge variant={levelBadges[level]} className="text-xs px-1.5 py-0">
+          <Badge variant={levelBadges[level]} className="text-xs px-1.5 py-0 focus:ring-0 focus:ring-offset-0">
             {level.toUpperCase()}
           </Badge>
         </div>
-        <div className={`flex-1 break-all ${levelColors[level]}`}>
+        <div className={`flex-1 break-words min-w-0 ${levelColors[level]}`}>
           {log}
         </div>
       </div>
@@ -263,10 +263,10 @@ const LogsPage: React.FC = () => {
         <CardContent className="p-0">
           <div
             ref={logsContainerRef}
-            className="h-[600px] overflow-y-auto bg-muted/20 border-t"
+            className="h-[600px] overflow-auto bg-muted/20"
           >
             {filteredLogs.length > 0 ? (
-              <div className="p-0">
+              <div className="pl-0.5 pr-0 pt-0.5 pb-0">
                 {filteredLogs.map((log, index) => formatLogEntry(log, index))}
                 <div ref={logsEndRef} className="h-1" />
               </div>
