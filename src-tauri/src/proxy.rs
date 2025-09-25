@@ -249,6 +249,12 @@ pub struct OpenAITool {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include_usage: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenAIRequest {
     pub model: String,
     pub messages: Vec<OpenAIMessage>,
@@ -278,6 +284,8 @@ pub struct OpenAIRequest {
     pub tools: Option<Vec<OpenAITool>>, // New tools parameter
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<Value>, // Tool choice parameter
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_options: Option<StreamOptions>, // Stream options parameter
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -935,7 +943,8 @@ fn transform_anthropic_streaming_chunk(
     request_id: &str,
     original_model: &str,
     created: u64,
-    usage_accumulator: &mut StreamingUsageAccumulator
+    usage_accumulator: &mut StreamingUsageAccumulator,
+    include_usage: bool
 ) -> Result<Vec<String>, anyhow::Error> {
     let chunk_str = std::str::from_utf8(chunk)?;
     let mut openai_chunks = Vec::new();
@@ -1055,16 +1064,20 @@ fn transform_anthropic_streaming_chunk(
                     }
                 },
                 Some("message_stop") => {
-                    // Emit final usage chunk before [DONE] if we have complete usage data
-                    if let Some(usage_chunk) = usage_accumulator.create_usage_chunk(request_id, original_model, created) {
-                        openai_chunks.push(usage_chunk);
-                        println!("[{}] [DEBUG] Emitted final complete usage chunk at stream end", request_id);
-                        println!("[{}] [DEBUG] Final usage: prompt={}, completion={}, total={}",
-                            request_id,
-                            usage_accumulator.input_tokens,
-                            usage_accumulator.output_tokens,
-                            usage_accumulator.input_tokens + usage_accumulator.output_tokens
-                        );
+                    // Only emit final usage chunk if explicitly requested via stream_options.include_usage
+                    if include_usage {
+                        if let Some(usage_chunk) = usage_accumulator.create_usage_chunk(request_id, original_model, created) {
+                            openai_chunks.push(usage_chunk);
+                            println!("[{}] [DEBUG] Emitted final complete usage chunk at stream end (include_usage=true)", request_id);
+                            println!("[{}] [DEBUG] Final usage: prompt={}, completion={}, total={}",
+                                request_id,
+                                usage_accumulator.input_tokens,
+                                usage_accumulator.output_tokens,
+                                usage_accumulator.input_tokens + usage_accumulator.output_tokens
+                            );
+                        }
+                    } else {
+                        println!("[{}] [DEBUG] Usage chunk NOT emitted (include_usage=false)", request_id);
                     }
 
                     // Final chunk
@@ -1096,11 +1109,22 @@ async fn handle_openai_chat_impl(
 
     let request_id = Uuid::new_v4().to_string()[..8].to_string();
     state.log_info(format!("[{}] OpenAI compatible request to /v1/chat/completions", request_id));
-    state.log_info(format!("[{}] Model: {}, Stream: {}",
+    state.log_info(format!("[{}] Model: {}, Stream: {}, StreamOptions: {:?}",
         request_id,
         openai_request.model,
-        openai_request.stream.unwrap_or(false)
+        openai_request.stream.unwrap_or(false),
+        openai_request.stream_options
     ));
+
+    // Log all incoming request headers
+    state.log_debug(format!("[{}] [DEBUG] Incoming request headers:", request_id));
+    for (name, value) in headers.iter() {
+        if let Ok(value_str) = value.to_str() {
+            state.log_debug(format!("[{}] [DEBUG]   {}: {}", request_id, name.as_str(), value_str));
+        } else {
+            state.log_debug(format!("[{}] [DEBUG]   {}: <non-utf8>", request_id, name.as_str()));
+        }
+    }
 
     // Debug logging for request body
     match serde_json::to_string_pretty(&openai_request) {
@@ -1173,6 +1197,20 @@ async fn handle_openai_chat_impl(
         }
     }
 
+    // Log outgoing request headers to Anthropic
+    state.log_debug(format!("[{}] [DEBUG] Outgoing Anthropic request to {}/v1/messages?beta=true", request_id, API_BASE));
+    state.log_debug(format!("[{}] [DEBUG] Outgoing headers to Anthropic:", request_id));
+    state.log_debug(format!("[{}] [DEBUG]   Authorization: Bearer <redacted>", request_id));
+    state.log_debug(format!("[{}] [DEBUG]   Content-Type: application/json", request_id));
+    state.log_debug(format!("[{}] [DEBUG]   anthropic-version: {}", request_id, ANTHROPIC_VERSION));
+    state.log_debug(format!("[{}] [DEBUG]   anthropic-beta: {}", request_id, ANTHROPIC_BETA));
+    state.log_debug(format!("[{}] [DEBUG]   User-Agent: claude-cli/1.0.113 (external, cli)", request_id));
+    if let Some(user_agent) = headers.get("user-agent") {
+        if let Ok(user_agent_str) = user_agent.to_str() {
+            state.log_debug(format!("[{}] [DEBUG]   X-Forwarded-User-Agent: {}", request_id, user_agent_str));
+        }
+    }
+
     let response = match req_builder.json(&anthropic_request).send().await {
         Ok(resp) => resp,
         Err(e) => {
@@ -1183,6 +1221,16 @@ async fn handle_openai_chat_impl(
 
     let status = response.status();
     state.log_info(format!("[{}] Anthropic API response: {}", request_id, status));
+
+    // Log all incoming response headers from Anthropic
+    state.log_debug(format!("[{}] [DEBUG] Anthropic response headers:", request_id));
+    for (name, value) in response.headers().iter() {
+        if let Ok(value_str) = value.to_str() {
+            state.log_debug(format!("[{}] [DEBUG]   {}: {}", request_id, name.as_str(), value_str));
+        } else {
+            state.log_debug(format!("[{}] [DEBUG]   {}: <non-utf8>", request_id, name.as_str()));
+        }
+    }
 
     // Capture important headers before consuming the response
     let mut response_headers = Vec::new();
@@ -1253,8 +1301,16 @@ async fn handle_openai_chat_impl(
             .header("Content-Type", "application/json");
 
         // Add captured headers
-        for (name, value) in response_headers {
-            response_builder = response_builder.header(&name, &value);
+        for (name, value) in response_headers.iter() {
+            response_builder = response_builder.header(name.as_str(), value.as_str());
+        }
+
+        // Log outgoing error response headers to client
+        state.log_debug(format!("[{}] [DEBUG] Outgoing error response headers to client:", request_id));
+        state.log_debug(format!("[{}] [DEBUG]   Status: {}", request_id, status.as_u16()));
+        state.log_debug(format!("[{}] [DEBUG]   Content-Type: application/json", request_id));
+        for (name, value) in &response_headers {
+            state.log_debug(format!("[{}] [DEBUG]   {}: {}", request_id, name, value));
         }
 
         return Ok(response_builder
@@ -1272,6 +1328,14 @@ async fn handle_openai_chat_impl(
         let request_id_clone = request_id.to_string();
         let state_clone = state.clone();
 
+        // Check if client requested usage statistics in streaming response
+        let include_usage = openai_request.stream_options
+            .as_ref()
+            .and_then(|opts| opts.include_usage)
+            .unwrap_or(false);
+
+        state.log_debug(format!("[{}] [DEBUG] stream_options.include_usage = {}", request_id, include_usage));
+
         // Create a stream that transforms Anthropic chunks to OpenAI format with stateful usage tracking
         let usage_accumulator = Arc::new(parking_lot::Mutex::new(StreamingUsageAccumulator::default()));
         let usage_accumulator_clone = usage_accumulator.clone();
@@ -1281,10 +1345,49 @@ async fn handle_openai_chat_impl(
                 Ok(chunk) => {
                     state_clone.log_debug(format!("[{}] [DEBUG] Processing chunk: {} bytes", request_id_clone, chunk.len()));
 
+                    // Log raw chunk data (first 500 chars for readability)
+                    let chunk_str = std::str::from_utf8(&chunk).unwrap_or("<non-utf8>");
+                    let preview = if chunk_str.len() > 500 {
+                        format!("{}... [truncated]", &chunk_str[..500])
+                    } else {
+                        chunk_str.to_string()
+                    };
+                    state_clone.log_debug(format!("[{}] [DEBUG] Raw chunk content: {}", request_id_clone, preview));
+
                     let mut accumulator = usage_accumulator_clone.lock();
-                    match transform_anthropic_streaming_chunk(&chunk, &request_id_clone, &original_model, created, &mut *accumulator) {
+
+                    // Log accumulator state before processing
+                    state_clone.log_debug(format!("[{}] [DEBUG] Accumulator state before: input_tokens={}, output_tokens={}, has_input={}, has_final_output={}",
+                        request_id_clone,
+                        accumulator.input_tokens,
+                        accumulator.output_tokens,
+                        accumulator.has_input_tokens,
+                        accumulator.has_final_output_tokens
+                    ));
+
+                    match transform_anthropic_streaming_chunk(&chunk, &request_id_clone, &original_model, created, &mut *accumulator, include_usage) {
                         Ok(openai_chunks) => {
                             state_clone.log_debug(format!("[{}] [DEBUG] Transformed to {} OpenAI chunks", request_id_clone, openai_chunks.len()));
+
+                            // Log each transformed chunk
+                            for (i, openai_chunk) in openai_chunks.iter().enumerate() {
+                                let preview = if openai_chunk.len() > 300 {
+                                    format!("{}... [truncated]", &openai_chunk[..300])
+                                } else {
+                                    openai_chunk.clone()
+                                };
+                                state_clone.log_debug(format!("[{}] [DEBUG] OpenAI chunk {}: {}", request_id_clone, i, preview));
+                            }
+
+                            // Log accumulator state after processing
+                            state_clone.log_debug(format!("[{}] [DEBUG] Accumulator state after: input_tokens={}, output_tokens={}, has_input={}, has_final_output={}",
+                                request_id_clone,
+                                accumulator.input_tokens,
+                                accumulator.output_tokens,
+                                accumulator.has_input_tokens,
+                                accumulator.has_final_output_tokens
+                            ));
+
                             let combined = openai_chunks.join("");
                             Ok(bytes::Bytes::from(combined))
                         }
@@ -1311,8 +1414,18 @@ async fn handle_openai_chat_impl(
             .header("Connection", "keep-alive");
 
         // Add captured headers
-        for (name, value) in response_headers {
-            response_builder = response_builder.header(&name, &value);
+        for (name, value) in response_headers.iter() {
+            response_builder = response_builder.header(name.as_str(), value.as_str());
+        }
+
+        // Log outgoing streaming response headers to client
+        state.log_debug(format!("[{}] [DEBUG] Outgoing streaming response headers to client:", request_id));
+        state.log_debug(format!("[{}] [DEBUG]   Status: 200", request_id));
+        state.log_debug(format!("[{}] [DEBUG]   Content-Type: text/event-stream", request_id));
+        state.log_debug(format!("[{}] [DEBUG]   Cache-Control: no-cache", request_id));
+        state.log_debug(format!("[{}] [DEBUG]   Connection: keep-alive", request_id));
+        for (name, value) in &response_headers {
+            state.log_debug(format!("[{}] [DEBUG]   {}: {}", request_id, name, value));
         }
 
         Ok(response_builder
@@ -1356,6 +1469,14 @@ async fn handle_openai_chat_impl(
                         // Add captured headers
                         for (name, value) in &response_headers {
                             response_builder = response_builder.header(name, value);
+                        }
+
+                        // Log outgoing non-streaming response headers to client
+                        state.log_debug(format!("[{}] [DEBUG] Outgoing non-streaming response headers to client:", request_id));
+                        state.log_debug(format!("[{}] [DEBUG]   Status: 200", request_id));
+                        state.log_debug(format!("[{}] [DEBUG]   Content-Type: application/json", request_id));
+                        for (name, value) in &response_headers {
+                            state.log_debug(format!("[{}] [DEBUG]   {}: {}", request_id, name, value));
                         }
 
                         Ok(response_builder

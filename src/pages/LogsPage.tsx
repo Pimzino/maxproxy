@@ -147,14 +147,14 @@ const LogsPage: React.FC = () => {
       error: 'text-red-600 dark:text-red-400',
       warning: 'text-yellow-600 dark:text-yellow-400',
       info: 'text-blue-600 dark:text-blue-400',
-      debug: 'text-gray-500 dark:text-gray-400',
+      debug: 'text-amber-600 dark:text-amber-400',
     };
 
     const levelBadges = {
-      error: 'destructive',
+      error: 'error',
       warning: 'warning',
-      info: 'default',
-      debug: 'secondary',
+      info: 'info',
+      debug: 'debug',
     } as const;
 
     return (
@@ -365,7 +365,7 @@ const LogsPage: React.FC = () => {
         <CardContent>
           <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
             <div className="flex items-center gap-2">
-              <Badge variant="destructive" className="text-xs">ERROR</Badge>
+              <Badge variant="error" className="text-xs">ERROR</Badge>
               <span className="text-sm text-muted-foreground">Critical errors</span>
             </div>
             <div className="flex items-center gap-2">
@@ -373,11 +373,11 @@ const LogsPage: React.FC = () => {
               <span className="text-sm text-muted-foreground">Important notices</span>
             </div>
             <div className="flex items-center gap-2">
-              <Badge variant="default" className="text-xs">INFO</Badge>
+              <Badge variant="info" className="text-xs">INFO</Badge>
               <span className="text-sm text-muted-foreground">General information</span>
             </div>
             <div className="flex items-center gap-2">
-              <Badge variant="secondary" className="text-xs">DEBUG</Badge>
+              <Badge variant="debug" className="text-xs">DEBUG</Badge>
               <span className="text-sm text-muted-foreground">Debug information</span>
             </div>
           </div>
@@ -388,3 +388,5 @@ const LogsPage: React.FC = () => {
 };
 
 export default LogsPage;
+
+
