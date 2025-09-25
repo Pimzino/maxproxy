@@ -9,7 +9,7 @@ mod proxy;
 mod storage;
 
 use oauth::OAuthManager;
-use proxy::{ProxyConfig, ProxyServer};
+use proxy::{LogEntry, ProxyConfig, ProxyServer};
 use storage::{TokenStatus, TokenStorage};
 
 // Global application state
@@ -167,7 +167,7 @@ async fn update_proxy_config(
 #[tauri::command]
 async fn get_logs(
     state: tauri::State<'_, AppState>,
-) -> Result<CommandResult<Vec<String>>, tauri::Error> {
+) -> Result<CommandResult<Vec<LogEntry>>, tauri::Error> {
     Ok(CommandResult::success(state.proxy_server.get_logs()))
 }
 
@@ -203,6 +203,8 @@ pub fn run() {
     };
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_opener::init())
         .manage(app_state)
         .invoke_handler(tauri::generate_handler![

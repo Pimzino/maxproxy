@@ -29,6 +29,21 @@ use uuid::Uuid;
 use crate::storage::TokenStorage;
 use crate::oauth::OAuthManager;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum LogLevel {
+    Error,
+    Warning,
+    Info,
+    Debug,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogEntry {
+    pub level: LogLevel,
+    pub timestamp: String,
+    pub message: String,
+}
+
 // Anthropic API configuration (hardcoded - not user configurable)
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const ANTHROPIC_BETA: &str = "claude-code-20250219,oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14";
@@ -336,7 +351,7 @@ pub struct ProxyServer {
     client: Client,
     running: Arc<AtomicBool>,
     server_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
-    logs: Arc<Mutex<Vec<String>>>,
+    logs: Arc<Mutex<Vec<LogEntry>>>,
 }
 
 impl ProxyServer {
@@ -372,7 +387,7 @@ impl ProxyServer {
         // Save configuration to file for persistence
         if let Err(e) = self.token_storage.save_config(&new_config) {
             // Log error but don't fail the operation
-            self.log(format!("Warning: Failed to save configuration: {}", e));
+            self.log_warning(format!("Failed to save configuration: {}", e));
         }
 
         let mut config = self.config.write();
@@ -380,7 +395,7 @@ impl ProxyServer {
         Ok(())
     }
 
-    pub fn get_logs(&self) -> Vec<String> {
+    pub fn get_logs(&self) -> Vec<LogEntry> {
         self.logs.lock().clone()
     }
 
@@ -388,14 +403,39 @@ impl ProxyServer {
         self.logs.lock().clear();
     }
 
-    fn log(&self, message: String) {
+    fn log_with_level(&self, level: LogLevel, message: String) {
         let mut logs = self.logs.lock();
-        logs.push(format!("[{}] {}", chrono::Utc::now().format("%H:%M:%S"), message));
+        logs.push(LogEntry {
+            level,
+            timestamp: chrono::Utc::now().format("%H:%M:%S").to_string(),
+            message,
+        });
 
         // Keep only last 1000 log entries
         let len = logs.len();
         if len > 1000 {
             logs.drain(0..len - 1000);
+        }
+    }
+
+    fn log_error(&self, message: String) {
+        self.log_with_level(LogLevel::Error, message);
+    }
+
+    fn log_warning(&self, message: String) {
+        self.log_with_level(LogLevel::Warning, message);
+    }
+
+    fn log_info(&self, message: String) {
+        self.log_with_level(LogLevel::Info, message);
+    }
+
+    fn log_debug(&self, message: String) {
+        // Only log debug messages when debug_mode is enabled
+        let config = self.config.read();
+        if config.debug_mode {
+            drop(config); // Release the lock before calling log_with_level
+            self.log_with_level(LogLevel::Debug, message);
         }
     }
 
@@ -409,10 +449,10 @@ impl ProxyServer {
             }
             Ok(None) => {
                 // Token is expired or doesn't exist, try to refresh
-                self.log(format!("[{}] Access token expired, attempting automatic refresh...", request_id));
+                self.log_info(format!("[{}] Access token expired, attempting automatic refresh...", request_id));
             }
             Err(e) => {
-                self.log(format!("[{}] Error getting access token: {}", request_id, e));
+                self.log_error(format!("[{}] Error getting access token: {}", request_id, e));
                 return Err(e);
             }
         }
@@ -421,11 +461,11 @@ impl ProxyServer {
         let refresh_token = match self.token_storage.get_refresh_token() {
             Ok(Some(token)) => token,
             Ok(None) => {
-                self.log(format!("[{}] No refresh token available", request_id));
+                self.log_warning(format!("[{}] No refresh token available", request_id));
                 return Ok(None);
             }
             Err(e) => {
-                self.log(format!("[{}] Error getting refresh token: {}", request_id, e));
+                self.log_error(format!("[{}] Error getting refresh token: {}", request_id, e));
                 return Err(e);
             }
         };
@@ -434,23 +474,23 @@ impl ProxyServer {
         let oauth_manager = self.oauth_manager.lock().await;
         match oauth_manager.refresh_token(&refresh_token).await {
             Ok(token_response) => {
-                self.log(format!("[{}] ✓ Successfully refreshed tokens", request_id));
+                self.log_info(format!("[{}] ✓ Successfully refreshed tokens", request_id));
 
                 // Save the new tokens
                 match self.token_storage.save_tokens(&token_response) {
                     Ok(_) => {
-                        self.log(format!("[{}] ✓ Saved refreshed tokens", request_id));
+                        self.log_info(format!("[{}] ✓ Saved refreshed tokens", request_id));
                         Ok(Some(token_response.access_token))
                     }
                     Err(e) => {
-                        self.log(format!("[{}] ✗ Failed to save refreshed tokens: {}", request_id, e));
+                        self.log_error(format!("[{}] ✗ Failed to save refreshed tokens: {}", request_id, e));
                         Err(e)
                     }
                 }
             }
             Err(e) => {
-                self.log(format!("[{}] ✗ Failed to refresh token: {}", request_id, e));
-                self.log(format!("[{}] Please re-authenticate using the OAuth flow", request_id));
+                self.log_error(format!("[{}] ✗ Failed to refresh token: {}", request_id, e));
+                self.log_info(format!("[{}] Please re-authenticate using the OAuth flow", request_id));
                 Ok(None)
             }
         }
@@ -466,7 +506,7 @@ impl ProxyServer {
         let socket_addr: SocketAddr = addr.parse()?;
 
         let listener = TcpListener::bind(&socket_addr).await?;
-        self.log(format!("Proxy server starting on {}", addr));
+        self.log_info(format!("Proxy server starting on {}", addr));
 
         // Build the router
         let app = self.build_router();
@@ -479,13 +519,17 @@ impl ProxyServer {
         let handle = tokio::spawn(async move {
             if let Err(e) = axum::serve(listener, app).await {
                 let mut logs = server_logs.lock();
-                logs.push(format!("[{}] Server error: {}", chrono::Utc::now().format("%H:%M:%S"), e));
+                logs.push(LogEntry {
+                    level: LogLevel::Error,
+                    timestamp: chrono::Utc::now().format("%H:%M:%S").to_string(),
+                    message: format!("Server error: {}", e),
+                });
             }
             server_running.store(false, Ordering::Relaxed);
         });
 
         *self.server_handle.lock() = Some(handle);
-        self.log("Proxy server started successfully".to_string());
+        self.log_info("Proxy server started successfully".to_string());
 
         Ok(())
     }
@@ -499,7 +543,7 @@ impl ProxyServer {
 
         if let Some(handle) = self.server_handle.lock().take() {
             handle.abort();
-            self.log("Proxy server stopped".to_string());
+            self.log_info("Proxy server stopped".to_string());
         }
 
         Ok(())
@@ -533,14 +577,18 @@ struct ProxyState {
     pub token_storage: Arc<TokenStorage>,
     oauth_manager: Arc<TokioMutex<OAuthManager>>,
     client: Client,
-    logs: Arc<Mutex<Vec<String>>>,
+    logs: Arc<Mutex<Vec<LogEntry>>>,
     config: Arc<RwLock<ProxyConfig>>,
 }
 
 impl ProxyState {
-    fn log(&self, message: String) {
+    fn log_with_level(&self, level: LogLevel, message: String) {
         let mut logs = self.logs.lock();
-        logs.push(format!("[{}] {}", chrono::Utc::now().format("%H:%M:%S"), message));
+        logs.push(LogEntry {
+            level,
+            timestamp: chrono::Utc::now().format("%H:%M:%S").to_string(),
+            message,
+        });
 
         let len = logs.len();
         if len > 1000 {
@@ -548,11 +596,24 @@ impl ProxyState {
         }
     }
 
-    fn debug_log(&self, message: String) {
+    fn log_error(&self, message: String) {
+        self.log_with_level(LogLevel::Error, message);
+    }
+
+    fn log_warning(&self, message: String) {
+        self.log_with_level(LogLevel::Warning, message);
+    }
+
+    fn log_info(&self, message: String) {
+        self.log_with_level(LogLevel::Info, message);
+    }
+
+    fn log_debug(&self, message: String) {
+        // Only log debug messages when debug_mode is enabled
         let config = self.config.read();
         if config.debug_mode {
-            drop(config); // Release the lock before calling log
-            self.log(message);
+            drop(config); // Release the lock before calling log_with_level
+            self.log_with_level(LogLevel::Debug, message);
         }
     }
 
@@ -566,10 +627,10 @@ impl ProxyState {
             }
             Ok(None) => {
                 // Token is expired or doesn't exist, try to refresh
-                self.log(format!("[{}] Access token expired, attempting automatic refresh...", request_id));
+                self.log_info(format!("[{}] Access token expired, attempting automatic refresh...", request_id));
             }
             Err(e) => {
-                self.log(format!("[{}] Error getting access token: {}", request_id, e));
+                self.log_error(format!("[{}] Error getting access token: {}", request_id, e));
                 return Err(e);
             }
         }
@@ -578,11 +639,11 @@ impl ProxyState {
         let refresh_token = match self.token_storage.get_refresh_token() {
             Ok(Some(token)) => token,
             Ok(None) => {
-                self.log(format!("[{}] No refresh token available", request_id));
+                self.log_warning(format!("[{}] No refresh token available", request_id));
                 return Ok(None);
             }
             Err(e) => {
-                self.log(format!("[{}] Error getting refresh token: {}", request_id, e));
+                self.log_error(format!("[{}] Error getting refresh token: {}", request_id, e));
                 return Err(e);
             }
         };
@@ -591,23 +652,23 @@ impl ProxyState {
         let oauth_manager = self.oauth_manager.lock().await;
         match oauth_manager.refresh_token(&refresh_token).await {
             Ok(token_response) => {
-                self.log(format!("[{}] ✓ Successfully refreshed tokens", request_id));
+                self.log_info(format!("[{}] ✓ Successfully refreshed tokens", request_id));
 
                 // Save the new tokens
                 match self.token_storage.save_tokens(&token_response) {
                     Ok(_) => {
-                        self.log(format!("[{}] ✓ Saved refreshed tokens", request_id));
+                        self.log_info(format!("[{}] ✓ Saved refreshed tokens", request_id));
                         Ok(Some(token_response.access_token))
                     }
                     Err(e) => {
-                        self.log(format!("[{}] ✗ Failed to save refreshed tokens: {}", request_id, e));
+                        self.log_error(format!("[{}] ✗ Failed to save refreshed tokens: {}", request_id, e));
                         Err(e)
                     }
                 }
             }
             Err(e) => {
-                self.log(format!("[{}] ✗ Failed to refresh token: {}", request_id, e));
-                self.log(format!("[{}] Please re-authenticate using the OAuth flow", request_id));
+                self.log_error(format!("[{}] ✗ Failed to refresh token: {}", request_id, e));
+                self.log_info(format!("[{}] Please re-authenticate using the OAuth flow", request_id));
                 Ok(None)
             }
         }
@@ -755,8 +816,8 @@ async fn handle_messages(
 ) -> Result<Response, StatusCode> {
     let request_id = Uuid::new_v4().to_string()[..8].to_string();
 
-    state.log(format!("[{}] Incoming request to /v1/messages", request_id));
-    state.log(format!("[{}] Model: {}, Stream: {}",
+    state.log_info(format!("[{}] Incoming request to /v1/messages", request_id));
+    state.log_info(format!("[{}] Model: {}, Stream: {}",
         request_id,
         request.model,
         request.stream.unwrap_or(false)
@@ -766,11 +827,11 @@ async fn handle_messages(
     let access_token = match state.get_valid_access_token(&request_id).await {
         Ok(Some(token)) => token,
         Ok(None) => {
-            state.log(format!("[{}] No valid access token available - authentication required", request_id));
+            state.log_warning(format!("[{}] No valid access token available - authentication required", request_id));
             return Err(StatusCode::UNAUTHORIZED);
         },
         Err(e) => {
-            state.log(format!("[{}] Token authentication error: {}", request_id, e));
+            state.log_error(format!("[{}] Token authentication error: {}", request_id, e));
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
     };
@@ -815,13 +876,13 @@ async fn handle_messages(
     let response = match req_builder.json(&request).send().await {
         Ok(resp) => resp,
         Err(e) => {
-            state.log(format!("[{}] Request failed: {}", request_id, e));
+            state.log_error(format!("[{}] Request failed: {}", request_id, e));
             return Err(StatusCode::BAD_GATEWAY);
         }
     };
 
     let status = response.status();
-    state.log(format!("[{}] Anthropic API responded with: {}", request_id, status));
+    state.log_info(format!("[{}] Anthropic API responded with: {}", request_id, status));
 
     if request.stream.unwrap_or(false) {
         // Handle streaming response
@@ -878,7 +939,7 @@ fn transform_anthropic_streaming_chunk(
         if let Some(data) = data_content {
             match event_type {
                 Some("message_start") => {
-                    if let Ok(data_json) = serde_json::from_str::<Value>(data) {
+                    if let Ok(_data_json) = serde_json::from_str::<Value>(data) {
                         let openai_chunk = OpenAIStreamResponse {
                             id: format!("chatcmpl-{}", request_id),
                             object: "chat.completion.chunk".to_string(),
@@ -984,8 +1045,8 @@ async fn handle_openai_chat_impl(
     }
 
     let request_id = Uuid::new_v4().to_string()[..8].to_string();
-    state.log(format!("[{}] OpenAI compatible request to /v1/chat/completions", request_id));
-    state.log(format!("[{}] Model: {}, Stream: {}",
+    state.log_info(format!("[{}] OpenAI compatible request to /v1/chat/completions", request_id));
+    state.log_info(format!("[{}] Model: {}, Stream: {}",
         request_id,
         openai_request.model,
         openai_request.stream.unwrap_or(false)
@@ -994,10 +1055,10 @@ async fn handle_openai_chat_impl(
     // Debug logging for request body
     match serde_json::to_string_pretty(&openai_request) {
         Ok(request_json) => {
-            state.debug_log(format!("[{}] [DEBUG] OpenAI request body:\n{}", request_id, request_json));
+            state.log_debug(format!("[{}] [DEBUG] OpenAI request body:\n{}", request_id, request_json));
         },
         Err(e) => {
-            state.debug_log(format!("[{}] [DEBUG] Failed to serialize request body: {}", request_id, e));
+            state.log_debug(format!("[{}] [DEBUG] Failed to serialize request body: {}", request_id, e));
         }
     }
 
@@ -1008,11 +1069,11 @@ async fn handle_openai_chat_impl(
     let access_token = match state.get_valid_access_token(&request_id).await {
         Ok(Some(token)) => token,
         Ok(None) => {
-            state.log(format!("[{}] No valid access token - authentication required", request_id));
+            state.log_warning(format!("[{}] No valid access token - authentication required", request_id));
             return Err(StatusCode::UNAUTHORIZED);
         },
         Err(e) => {
-            state.log(format!("[{}] Token error: {}", request_id, e));
+            state.log_error(format!("[{}] Token error: {}", request_id, e));
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
     };
@@ -1024,10 +1085,10 @@ async fn handle_openai_chat_impl(
     // Debug logging for transformed Anthropic request
     match serde_json::to_string_pretty(&anthropic_request) {
         Ok(request_json) => {
-            state.debug_log(format!("[{}] [DEBUG] Transformed Anthropic request body:\n{}", request_id, request_json));
+            state.log_debug(format!("[{}] [DEBUG] Transformed Anthropic request body:\n{}", request_id, request_json));
         },
         Err(e) => {
-            state.debug_log(format!("[{}] [DEBUG] Failed to serialize Anthropic request body: {}", request_id, e));
+            state.log_debug(format!("[{}] [DEBUG] Failed to serialize Anthropic request body: {}", request_id, e));
         }
     }
 
@@ -1065,13 +1126,13 @@ async fn handle_openai_chat_impl(
     let response = match req_builder.json(&anthropic_request).send().await {
         Ok(resp) => resp,
         Err(e) => {
-            state.log(format!("[{}] Request failed: {}", request_id, e));
+            state.log_error(format!("[{}] Request failed: {}", request_id, e));
             return Err(StatusCode::BAD_GATEWAY);
         }
     };
 
     let status = response.status();
-    state.log(format!("[{}] Anthropic API response: {}", request_id, status));
+    state.log_info(format!("[{}] Anthropic API response: {}", request_id, status));
 
     // Capture important headers before consuming the response
     let mut response_headers = Vec::new();
@@ -1090,17 +1151,17 @@ async fn handle_openai_chat_impl(
     if !status.is_success() {
         // Handle error response - transform to OpenAI format
         let error_text = response.text().await.unwrap_or_default();
-        state.log(format!("[{}] Anthropic API error ({}): {}", request_id, status, &error_text));
+        state.log_error(format!("[{}] Anthropic API error ({}): {}", request_id, status, &error_text));
 
         // Debug logging for raw Anthropic error response
-        state.debug_log(format!("[{}] [DEBUG] Raw Anthropic error response:\n{}", request_id, error_text));
+        state.log_debug(format!("[{}] [DEBUG] Raw Anthropic error response:\n{}", request_id, error_text));
 
         // Try to parse and transform the error to OpenAI format
         let openai_error = match serde_json::from_str::<Value>(&error_text) {
             Ok(anthropic_error) => {
                 // Check if it's an Anthropic error format
                 if anthropic_error.get("type").and_then(|t| t.as_str()) == Some("error") {
-                    state.debug_log(format!("[{}] [DEBUG] Transforming Anthropic error to OpenAI format", request_id));
+                    state.log_debug(format!("[{}] [DEBUG] Transforming Anthropic error to OpenAI format", request_id));
                     transform_anthropic_error_to_openai(&anthropic_error)
                 } else {
                     // Not standard Anthropic error format, create generic OpenAI error
@@ -1130,10 +1191,10 @@ async fn handle_openai_chat_impl(
         // Debug logging for transformed OpenAI error
         match serde_json::to_string_pretty(&openai_error) {
             Ok(error_json) => {
-                state.debug_log(format!("[{}] [DEBUG] Transformed OpenAI error:\n{}", request_id, error_json));
+                state.log_debug(format!("[{}] [DEBUG] Transformed OpenAI error:\n{}", request_id, error_json));
             },
             Err(e) => {
-                state.debug_log(format!("[{}] [DEBUG] Failed to serialize OpenAI error: {}", request_id, e));
+                state.log_debug(format!("[{}] [DEBUG] Failed to serialize OpenAI error: {}", request_id, e));
             }
         }
 
@@ -1153,8 +1214,8 @@ async fn handle_openai_chat_impl(
 
     if openai_request.stream.unwrap_or(false) {
         // Transform streaming response from Anthropic to OpenAI format
-        state.log(format!("[{}] Streaming response with OpenAI transformation", request_id));
-        state.debug_log(format!("[{}] [DEBUG] Starting stream transformation", request_id));
+        state.log_info(format!("[{}] Streaming response with OpenAI transformation", request_id));
+        state.log_debug(format!("[{}] [DEBUG] Starting stream transformation", request_id));
 
         let created = chrono::Utc::now().timestamp() as u64;
         let original_model = openai_request.model.clone();
@@ -1165,23 +1226,23 @@ async fn handle_openai_chat_impl(
         let stream = response.bytes_stream().map(move |chunk_result| {
             match chunk_result {
                 Ok(chunk) => {
-                    state_clone.debug_log(format!("[{}] [DEBUG] Processing chunk: {} bytes", request_id_clone, chunk.len()));
+                    state_clone.log_debug(format!("[{}] [DEBUG] Processing chunk: {} bytes", request_id_clone, chunk.len()));
 
                     match transform_anthropic_streaming_chunk(&chunk, &request_id_clone, &original_model, created) {
                         Ok(openai_chunks) => {
-                            state_clone.debug_log(format!("[{}] [DEBUG] Transformed to {} OpenAI chunks", request_id_clone, openai_chunks.len()));
+                            state_clone.log_debug(format!("[{}] [DEBUG] Transformed to {} OpenAI chunks", request_id_clone, openai_chunks.len()));
                             let combined = openai_chunks.join("");
                             Ok(bytes::Bytes::from(combined))
                         }
                         Err(e) => {
-                            state_clone.log(format!("[{}] Stream transformation error: {}", request_id_clone, e));
+                            state_clone.log_error(format!("[{}] Stream transformation error: {}", request_id_clone, e));
                             // Forward original chunk on error
                             Ok(chunk)
                         }
                     }
                 }
                 Err(e) => {
-                    state_clone.log(format!("[{}] Stream read error: {}", request_id_clone, e));
+                    state_clone.log_error(format!("[{}] Stream read error: {}", request_id_clone, e));
                     Err(e)
                 }
             }
@@ -1208,21 +1269,21 @@ async fn handle_openai_chat_impl(
         let response_text = response.text().await.unwrap_or_default();
 
         // Debug logging for raw Anthropic response
-        state.debug_log(format!("[{}] [DEBUG] Raw Anthropic response:\n{}", request_id, response_text));
+        state.log_debug(format!("[{}] [DEBUG] Raw Anthropic response:\n{}", request_id, response_text));
 
         match serde_json::from_str::<Value>(&response_text) {
             Ok(anthropic_response) => {
                 match transform_anthropic_to_openai(&anthropic_response, &openai_request.model, &request_id) {
                     Ok(openai_response) => {
-                        state.log(format!("[{}] Successfully transformed to OpenAI format", request_id));
+                        state.log_info(format!("[{}] Successfully transformed to OpenAI format", request_id));
 
                         // Debug logging for transformed OpenAI response
                         match serde_json::to_string_pretty(&openai_response) {
                             Ok(response_json) => {
-                                state.debug_log(format!("[{}] [DEBUG] Transformed OpenAI response:\n{}", request_id, response_json));
+                                state.log_debug(format!("[{}] [DEBUG] Transformed OpenAI response:\n{}", request_id, response_json));
                             },
                             Err(e) => {
-                                state.debug_log(format!("[{}] [DEBUG] Failed to serialize OpenAI response: {}", request_id, e));
+                                state.log_debug(format!("[{}] [DEBUG] Failed to serialize OpenAI response: {}", request_id, e));
                             }
                         }
 
@@ -1240,13 +1301,13 @@ async fn handle_openai_chat_impl(
                             .unwrap())
                     },
                     Err(e) => {
-                        state.log(format!("[{}] Transform error: {}", request_id, e));
+                        state.log_error(format!("[{}] Transform error: {}", request_id, e));
                         Err(StatusCode::INTERNAL_SERVER_ERROR)
                     }
                 }
             },
             Err(e) => {
-                state.log(format!("[{}] Parse error: {}", request_id, e));
+                state.log_error(format!("[{}] Parse error: {}", request_id, e));
                 Err(StatusCode::INTERNAL_SERVER_ERROR)
             }
         }

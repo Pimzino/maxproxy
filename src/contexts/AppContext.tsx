@@ -1,5 +1,5 @@
 import React, { createContext, useContext, useReducer, useEffect } from 'react';
-import { AppState, TokenStatus, ProxyConfig } from '@/types';
+import { AppState, TokenStatus, ProxyConfig, LogEntry } from '@/types';
 import { getTokenStatus, getProxyStatus, getProxyConfig } from '@/lib/api';
 
 interface AppContextType {
@@ -8,7 +8,7 @@ interface AppContextType {
   updateTokenStatus: (status: TokenStatus) => void;
   updateProxyConfig: (config: ProxyConfig) => void;
   updateProxyRunning: (running: boolean) => void;
-  updateLogs: (logs: string[]) => void;
+  updateLogs: (logs: LogEntry[]) => void;
   refreshAppState: () => Promise<void>;
 }
 
@@ -18,7 +18,7 @@ type AppAction =
   | { type: 'UPDATE_TOKEN_STATUS'; payload: TokenStatus }
   | { type: 'UPDATE_PROXY_CONFIG'; payload: ProxyConfig }
   | { type: 'UPDATE_PROXY_RUNNING'; payload: boolean }
-  | { type: 'UPDATE_LOGS'; payload: string[] };
+  | { type: 'UPDATE_LOGS'; payload: LogEntry[] };
 
 const initialState: AppState = {
   tokenStatus: null,
@@ -62,7 +62,7 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
     dispatch({ type: 'UPDATE_PROXY_RUNNING', payload: running });
   };
 
-  const updateLogs = (logs: string[]) => {
+  const updateLogs = (logs: LogEntry[]) => {
     dispatch({ type: 'UPDATE_LOGS', payload: logs });
   };
 

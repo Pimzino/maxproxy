@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import { useMutation, useQuery } from '@tanstack/react-query';
 import {
   Shield,
@@ -27,26 +27,7 @@ import {
 const AuthPage: React.FC = () => {
   const { state, refreshAppState } = useAppContext();
   const [authCode, setAuthCode] = useState('');
-  const [isDarkMode, setIsDarkMode] = useState(false);
 
-  // Detect dark mode changes
-  useEffect(() => {
-    const checkDarkMode = () => {
-      setIsDarkMode(document.documentElement.classList.contains('dark'));
-    };
-
-    // Check initially
-    checkDarkMode();
-
-    // Create observer to watch for dark mode changes
-    const observer = new MutationObserver(checkDarkMode);
-    observer.observe(document.documentElement, {
-      attributes: true,
-      attributeFilter: ['class']
-    });
-
-    return () => observer.disconnect();
-  }, []);
   const [message, setMessage] = useState<{ type: 'success' | 'error' | 'info'; text: string } | null>(null);
 
   // Query for token status

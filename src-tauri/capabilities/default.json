@@ -5,6 +5,9 @@
   "windows": ["main"],
   "permissions": [
     "core:default",
+    "dialog:default",
+    "fs:default",
+    "fs:allow-write-text-file",
     "opener:default"
   ]
 }

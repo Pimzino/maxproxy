@@ -19,9 +19,17 @@ export interface ProxyConfig {
   openai_compatible: boolean;
 }
 
+export type LogLevel = 'Error' | 'Warning' | 'Info' | 'Debug';
+
+export interface LogEntry {
+  level: LogLevel;
+  timestamp: string;
+  message: string;
+}
+
 export interface AppState {
   tokenStatus: TokenStatus | null;
   proxyConfig: ProxyConfig | null;
   proxyRunning: boolean;
-  logs: string[];
+  logs: LogEntry[];
 }

@@ -18,6 +18,7 @@ import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { getLogs, clearLogs } from '@/lib/api';
+import { LogEntry } from '@/types';
 
 const LogsPage: React.FC = () => {
   const [searchTerm, setSearchTerm] = useState('');
@@ -76,18 +77,55 @@ const LogsPage: React.FC = () => {
     }
   };
 
-  const handleExportLogs = () => {
-    const logsText = logs.join('\n');
-    const blob = new Blob([logsText], { type: 'text/plain' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `maxproxy-logs-${new Date().toISOString().split('T')[0]}.txt`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-    setMessage({ type: 'info', text: 'Logs exported successfully!' });
+  const handleExportLogs = async () => {
+    try {
+      // Prepare log content
+      const logsText = logs.map(log =>
+        `[${log.timestamp}] [${log.level.toUpperCase()}] ${log.message}`
+      ).join('\n');
+
+      // Generate default filename
+      const defaultFilename = `maxproxy-logs-${new Date().toISOString().split('T')[0]}.txt`;
+
+      // Use Tauri native file dialog (dynamic import to avoid Vite issues during dev)
+      const { save } = await import('@tauri-apps/plugin-dialog');
+      const { writeTextFile } = await import('@tauri-apps/plugin-fs');
+
+      const filePath = await save({
+        defaultPath: defaultFilename,
+        filters: [
+          {
+            name: 'Text Files',
+            extensions: ['txt']
+          },
+          {
+            name: 'All Files',
+            extensions: ['*']
+          }
+        ]
+      });
+
+      if (filePath) {
+        // Write file to chosen location
+        await writeTextFile(filePath, logsText);
+        setMessage({
+          type: 'info',
+          text: `Logs exported successfully to: ${filePath}`
+        });
+      } else {
+        // User cancelled the dialog
+        setMessage({
+          type: 'info',
+          text: 'Export cancelled'
+        });
+      }
+    } catch (error) {
+      console.error('Error exporting logs:', error);
+      setMessage({
+        type: 'error',
+        text: `Failed to export logs: ${error}`
+      });
+    }
   };
 
   const handleScrollToBottom = () => {
@@ -98,19 +136,13 @@ const LogsPage: React.FC = () => {
   };
 
   const filteredLogs = logs.filter((log) =>
-    searchTerm === '' || log.toLowerCase().includes(searchTerm.toLowerCase())
+    searchTerm === '' ||
+    log.message.toLowerCase().includes(searchTerm.toLowerCase()) ||
+    log.level.toLowerCase().includes(searchTerm.toLowerCase())
   );
 
-  const getLogLevel = (log: string): 'error' | 'warning' | 'info' | 'debug' => {
-    const lowercaseLog = log.toLowerCase();
-    if (lowercaseLog.includes('error') || lowercaseLog.includes('failed')) return 'error';
-    if (lowercaseLog.includes('warning') || lowercaseLog.includes('warn')) return 'warning';
-    if (lowercaseLog.includes('debug')) return 'debug';
-    return 'info';
-  };
-
-  const formatLogEntry = (log: string, index: number) => {
-    const level = getLogLevel(log);
+  const formatLogEntry = (logEntry: LogEntry, index: number) => {
+    const level = logEntry.level.toLowerCase() as 'error' | 'warning' | 'info' | 'debug';
     const levelColors = {
       error: 'text-red-600 dark:text-red-400',
       warning: 'text-yellow-600 dark:text-yellow-400',
@@ -130,16 +162,19 @@ const LogsPage: React.FC = () => {
         key={index}
         className="flex items-start gap-3 py-2 px-3 hover:bg-muted/50 text-sm font-mono hover:border-l-2 hover:border-primary/20 transition-colors overflow-hidden"
       >
+        <div className="flex-shrink-0 w-16 text-xs text-muted-foreground">
+          {logEntry.timestamp}
+        </div>
         <div className="flex-shrink-0 w-12 text-xs text-muted-foreground">
           {String(index + 1).padStart(3, '0')}
         </div>
         <div className="flex-shrink-0">
           <Badge variant={levelBadges[level]} className="text-xs px-1.5 py-0 focus:ring-0 focus:ring-offset-0">
-            {level.toUpperCase()}
+            {logEntry.level.toUpperCase()}
           </Badge>
         </div>
         <div className={`flex-1 break-words min-w-0 ${levelColors[level]}`}>
-          {log}
+          {logEntry.message}
         </div>
       </div>
     );
@@ -267,7 +302,7 @@ const LogsPage: React.FC = () => {
           >
             {filteredLogs.length > 0 ? (
               <div className="pl-0.5 pr-0 pt-0.5 pb-0">
-                {filteredLogs.map((log, index) => formatLogEntry(log, index))}
+                {filteredLogs.map((logEntry, index) => formatLogEntry(logEntry, index))}
                 <div ref={logsEndRef} className="h-1" />
               </div>
             ) : (
