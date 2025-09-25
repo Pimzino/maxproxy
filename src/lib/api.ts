@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import { CommandResult, TokenStatus, ProxyConfig, LogEntry } from '@/types';
+import { CommandResult, TokenStatus, ProxyConfig, LogEntry, InitStatus } from '@/types';
 
 // OAuth API
 export const startOAuthFlow = async (): Promise<CommandResult<string>> => {
@@ -51,4 +51,9 @@ export const getLogs = async (): Promise<CommandResult<LogEntry[]>> => {
 
 export const clearLogs = async (): Promise<CommandResult<void>> => {
   return invoke('clear_logs');
+};
+
+// Initialization API
+export const getInitStatus = async (): Promise<CommandResult<InitStatus>> => {
+  return invoke('get_init_status');
 };

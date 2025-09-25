@@ -1,6 +1,6 @@
 import React, { createContext, useContext, useReducer, useEffect } from 'react';
-import { AppState, TokenStatus, ProxyConfig, LogEntry } from '@/types';
-import { getTokenStatus, getProxyStatus, getProxyConfig } from '@/lib/api';
+import { AppState, TokenStatus, ProxyConfig, LogEntry, InitStatus } from '@/types';
+import { getTokenStatus, getProxyStatus, getProxyConfig, getInitStatus } from '@/lib/api';
 
 interface AppContextType {
   state: AppState;
@@ -9,6 +9,7 @@ interface AppContextType {
   updateProxyConfig: (config: ProxyConfig) => void;
   updateProxyRunning: (running: boolean) => void;
   updateLogs: (logs: LogEntry[]) => void;
+  updateInitStatus: (status: InitStatus) => void;
   refreshAppState: () => Promise<void>;
 }
 
@@ -18,13 +19,15 @@ type AppAction =
   | { type: 'UPDATE_TOKEN_STATUS'; payload: TokenStatus }
   | { type: 'UPDATE_PROXY_CONFIG'; payload: ProxyConfig }
   | { type: 'UPDATE_PROXY_RUNNING'; payload: boolean }
-  | { type: 'UPDATE_LOGS'; payload: LogEntry[] };
+  | { type: 'UPDATE_LOGS'; payload: LogEntry[] }
+  | { type: 'UPDATE_INIT_STATUS'; payload: InitStatus };
 
 const initialState: AppState = {
   tokenStatus: null,
   proxyConfig: null,
   proxyRunning: false,
   logs: [],
+  initStatus: null,
 };
 
 const appReducer = (state: AppState, action: AppAction): AppState => {
@@ -37,6 +40,8 @@ const appReducer = (state: AppState, action: AppAction): AppState => {
       return { ...state, proxyRunning: action.payload };
     case 'UPDATE_LOGS':
       return { ...state, logs: action.payload };
+    case 'UPDATE_INIT_STATUS':
+      return { ...state, initStatus: action.payload };
     default:
       return state;
   }
@@ -66,6 +71,10 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
     dispatch({ type: 'UPDATE_LOGS', payload: logs });
   };
 
+  const updateInitStatus = (status: InitStatus) => {
+    dispatch({ type: 'UPDATE_INIT_STATUS', payload: status });
+  };
+
   const refreshAppState = async () => {
     try {
       // Load token status
@@ -92,11 +101,44 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
 
   const initializeApp = async () => {
     try {
+      // First, monitor the initialization status from the backend
+      await monitorInitialization();
+
+      // Then load the app state
       await refreshAppState();
     } catch (error) {
       console.error('Failed to initialize app:', error);
     } finally {
       setIsInitialized(true);
+    }
+  };
+
+  const monitorInitialization = async () => {
+    const maxChecks = 30; // Maximum 15 seconds (500ms * 30)
+    let checks = 0;
+
+    while (checks < maxChecks) {
+      try {
+        const initResult = await getInitStatus();
+        if (initResult.success && initResult.data) {
+          updateInitStatus(initResult.data);
+
+          // If initialization is complete (whether successful or failed), break
+          if (initResult.data.initialization_complete) {
+            console.log('[AppInit] Backend initialization complete');
+            break;
+          }
+        }
+
+        checks++;
+
+        // Wait 500ms before next check
+        await new Promise(resolve => setTimeout(resolve, 500));
+      } catch (error) {
+        console.error('Failed to get init status:', error);
+        checks++;
+        await new Promise(resolve => setTimeout(resolve, 500));
+      }
     }
   };
 
@@ -127,6 +169,7 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
     updateProxyConfig,
     updateProxyRunning,
     updateLogs,
+    updateInitStatus,
     refreshAppState,
   };
 

@@ -335,6 +335,12 @@ pub struct OpenAIModel {
     pub object: String,
     pub created: u64,
     pub owned_by: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_length: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_completion_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -675,6 +681,52 @@ impl ProxyState {
     }
 }
 
+// Get model metadata including context length and capabilities
+fn get_model_metadata(model_id: &str) -> (u32, u32, serde_json::Value) {
+    let base_model = get_base_model_name(model_id);
+
+    // Context length and max completion tokens based on model
+    let (context_length, max_completion_tokens) = match base_model.as_str() {
+        "claude-opus-4-1-20250805" => (200000, 8192),
+        "claude-opus-4-20250514" => (200000, 8192),
+        "claude-sonnet-4-20250514" => {
+            // Sonnet 4 supports extended context with beta header
+            (200000, 8192) // Standard context, can be up to 1M with beta
+        },
+        "claude-3-7-sonnet-20250219" => (200000, 8192),
+        "claude-3-5-haiku-20241022" => (200000, 4096),
+        "claude-3-haiku-20240307" => (200000, 4096),
+        _ => (200000, 4096), // Default for unknown models
+    };
+
+    // Build capabilities object
+    let mut capabilities = serde_json::Map::new();
+    capabilities.insert("completion".to_string(), serde_json::Value::Bool(true));
+    capabilities.insert("chat".to_string(), serde_json::Value::Bool(true));
+    capabilities.insert("streaming".to_string(), serde_json::Value::Bool(true));
+
+    // Check if model supports thinking
+    if supports_thinking(&base_model) {
+        capabilities.insert("thinking".to_string(), serde_json::Value::Bool(true));
+    }
+
+    // Check if it's a thinking variant
+    if model_id.contains("-thinking-") {
+        capabilities.insert("thinking_enabled".to_string(), serde_json::Value::Bool(true));
+        if let Some(budget) = get_thinking_budget_tokens(model_id) {
+            capabilities.insert("thinking_budget_tokens".to_string(), serde_json::Value::Number(serde_json::Number::from(budget)));
+        }
+    }
+
+    // Extended context support for Sonnet 4
+    if base_model == "claude-sonnet-4-20250514" {
+        capabilities.insert("extended_context".to_string(), serde_json::Value::Bool(true));
+        capabilities.insert("max_context_length".to_string(), serde_json::Value::Number(serde_json::Number::from(1000000)));
+    }
+
+    (context_length, max_completion_tokens, serde_json::Value::Object(capabilities))
+}
+
 async fn handle_models(
     axum::extract::State(state): axum::extract::State<ProxyState>,
 ) -> Result<Json<OpenAIModelsResponse>, StatusCode> {
@@ -683,125 +735,49 @@ async fn handle_models(
         return Err(StatusCode::NOT_FOUND);
     }
 
-    let models = vec![
+    let model_ids = vec![
         // Standard Anthropic models
-        OpenAIModel {
-            id: "claude-opus-4-1-20250805".to_string(),
-            object: "model".to_string(),
-            created: 1687882411,
-            owned_by: "anthropic".to_string(),
-        },
-        OpenAIModel {
-            id: "claude-opus-4-20250514".to_string(),
-            object: "model".to_string(),
-            created: 1687882411,
-            owned_by: "anthropic".to_string(),
-        },
-        OpenAIModel {
-            id: "claude-sonnet-4-20250514".to_string(),
-            object: "model".to_string(),
-            created: 1687882411,
-            owned_by: "anthropic".to_string(),
-        },
-        OpenAIModel {
-            id: "claude-3-7-sonnet-20250219".to_string(),
-            object: "model".to_string(),
-            created: 1687882411,
-            owned_by: "anthropic".to_string(),
-        },
-        OpenAIModel {
-            id: "claude-3-5-haiku-20241022".to_string(),
-            object: "model".to_string(),
-            created: 1687882411,
-            owned_by: "anthropic".to_string(),
-        },
-        OpenAIModel {
-            id: "claude-3-haiku-20240307".to_string(),
-            object: "model".to_string(),
-            created: 1687882411,
-            owned_by: "anthropic".to_string(),
-        },
+        "claude-opus-4-1-20250805",
+        "claude-opus-4-20250514",
+        "claude-sonnet-4-20250514",
+        "claude-3-7-sonnet-20250219",
+        "claude-3-5-haiku-20241022",
+        "claude-3-haiku-20240307",
 
         // Thinking variants for Claude Opus 4.1
-        OpenAIModel {
-            id: "claude-opus-4-1-20250805-thinking-low".to_string(),
-            object: "model".to_string(),
-            created: 1687882411,
-            owned_by: "anthropic".to_string(),
-        },
-        OpenAIModel {
-            id: "claude-opus-4-1-20250805-thinking-medium".to_string(),
-            object: "model".to_string(),
-            created: 1687882411,
-            owned_by: "anthropic".to_string(),
-        },
-        OpenAIModel {
-            id: "claude-opus-4-1-20250805-thinking-high".to_string(),
-            object: "model".to_string(),
-            created: 1687882411,
-            owned_by: "anthropic".to_string(),
-        },
+        "claude-opus-4-1-20250805-thinking-low",
+        "claude-opus-4-1-20250805-thinking-medium",
+        "claude-opus-4-1-20250805-thinking-high",
 
         // Thinking variants for Claude Opus 4
-        OpenAIModel {
-            id: "claude-opus-4-20250514-thinking-low".to_string(),
-            object: "model".to_string(),
-            created: 1687882411,
-            owned_by: "anthropic".to_string(),
-        },
-        OpenAIModel {
-            id: "claude-opus-4-20250514-thinking-medium".to_string(),
-            object: "model".to_string(),
-            created: 1687882411,
-            owned_by: "anthropic".to_string(),
-        },
-        OpenAIModel {
-            id: "claude-opus-4-20250514-thinking-high".to_string(),
-            object: "model".to_string(),
-            created: 1687882411,
-            owned_by: "anthropic".to_string(),
-        },
+        "claude-opus-4-20250514-thinking-low",
+        "claude-opus-4-20250514-thinking-medium",
+        "claude-opus-4-20250514-thinking-high",
 
         // Thinking variants for Claude Sonnet 4
-        OpenAIModel {
-            id: "claude-sonnet-4-20250514-thinking-low".to_string(),
-            object: "model".to_string(),
-            created: 1687882411,
-            owned_by: "anthropic".to_string(),
-        },
-        OpenAIModel {
-            id: "claude-sonnet-4-20250514-thinking-medium".to_string(),
-            object: "model".to_string(),
-            created: 1687882411,
-            owned_by: "anthropic".to_string(),
-        },
-        OpenAIModel {
-            id: "claude-sonnet-4-20250514-thinking-high".to_string(),
-            object: "model".to_string(),
-            created: 1687882411,
-            owned_by: "anthropic".to_string(),
-        },
+        "claude-sonnet-4-20250514-thinking-low",
+        "claude-sonnet-4-20250514-thinking-medium",
+        "claude-sonnet-4-20250514-thinking-high",
 
         // Thinking variants for Claude Sonnet 3.7
-        OpenAIModel {
-            id: "claude-3-7-sonnet-20250219-thinking-low".to_string(),
-            object: "model".to_string(),
-            created: 1687882411,
-            owned_by: "anthropic".to_string(),
-        },
-        OpenAIModel {
-            id: "claude-3-7-sonnet-20250219-thinking-medium".to_string(),
-            object: "model".to_string(),
-            created: 1687882411,
-            owned_by: "anthropic".to_string(),
-        },
-        OpenAIModel {
-            id: "claude-3-7-sonnet-20250219-thinking-high".to_string(),
-            object: "model".to_string(),
-            created: 1687882411,
-            owned_by: "anthropic".to_string(),
-        },
+        "claude-3-7-sonnet-20250219-thinking-low",
+        "claude-3-7-sonnet-20250219-thinking-medium",
+        "claude-3-7-sonnet-20250219-thinking-high",
     ];
+
+    let models = model_ids.into_iter().map(|id| {
+        let (context_length, max_completion_tokens, capabilities) = get_model_metadata(id);
+
+        OpenAIModel {
+            id: id.to_string(),
+            object: "model".to_string(),
+            created: 1687882411,
+            owned_by: "anthropic".to_string(),
+            context_length: Some(context_length),
+            max_completion_tokens: Some(max_completion_tokens),
+            capabilities: Some(capabilities),
+        }
+    }).collect();
 
     Ok(Json(OpenAIModelsResponse {
         object: "list".to_string(),
@@ -908,12 +884,58 @@ async fn handle_messages(
     }
 }
 
+// Accumulator for usage information across streaming chunks
+#[derive(Default)]
+struct StreamingUsageAccumulator {
+    input_tokens: u32,
+    output_tokens: u32,
+    has_input_tokens: bool,
+    has_final_output_tokens: bool,
+}
+
+impl StreamingUsageAccumulator {
+    fn set_input_tokens(&mut self, tokens: u32) {
+        if !self.has_input_tokens {
+            self.input_tokens = tokens;
+            self.has_input_tokens = true;
+        }
+    }
+
+    fn set_final_output_tokens(&mut self, tokens: u32) {
+        self.output_tokens = tokens;
+        self.has_final_output_tokens = true;
+    }
+
+    fn create_usage_chunk(&self, request_id: &str, original_model: &str, created: u64) -> Option<String> {
+        if self.has_input_tokens && self.has_final_output_tokens {
+            let total_tokens = self.input_tokens + self.output_tokens;
+            let usage_chunk = serde_json::json!({
+                "id": format!("chatcmpl-{}", request_id),
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": original_model,
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": self.input_tokens,
+                    "completion_tokens": self.output_tokens,
+                    "total_tokens": total_tokens
+                }
+            });
+
+            Some(format!("data: {}\n\n", serde_json::to_string(&usage_chunk).unwrap()))
+        } else {
+            None
+        }
+    }
+}
+
 // Transform Anthropic streaming chunk to OpenAI format
 fn transform_anthropic_streaming_chunk(
     chunk: &[u8],
     request_id: &str,
     original_model: &str,
-    created: u64
+    created: u64,
+    usage_accumulator: &mut StreamingUsageAccumulator
 ) -> Result<Vec<String>, anyhow::Error> {
     let chunk_str = std::str::from_utf8(chunk)?;
     let mut openai_chunks = Vec::new();
@@ -939,7 +961,7 @@ fn transform_anthropic_streaming_chunk(
         if let Some(data) = data_content {
             match event_type {
                 Some("message_start") => {
-                    if let Ok(_data_json) = serde_json::from_str::<Value>(data) {
+                    if let Ok(data_json) = serde_json::from_str::<Value>(data) {
                         let openai_chunk = OpenAIStreamResponse {
                             id: format!("chatcmpl-{}", request_id),
                             object: "chat.completion.chunk".to_string(),
@@ -957,6 +979,14 @@ fn transform_anthropic_streaming_chunk(
 
                         let formatted = format!("data: {}\n\n", serde_json::to_string(&openai_chunk)?);
                         openai_chunks.push(formatted);
+
+                        // Store input tokens for later usage chunk
+                        if let Some(usage) = data_json.get("message").and_then(|m| m.get("usage")) {
+                            let input_tokens = usage.get("input_tokens").and_then(|t| t.as_u64()).unwrap_or(0) as u32;
+                            usage_accumulator.set_input_tokens(input_tokens);
+
+                            println!("[{}] [DEBUG] Stored input_tokens from message_start: {}", request_id, input_tokens);
+                        }
                     }
                 },
                 Some("content_block_delta") => {
@@ -985,8 +1015,8 @@ fn transform_anthropic_streaming_chunk(
                     }
                 },
                 Some("message_delta") => {
-                    // Handle stop reason in message_delta
                     if let Ok(data_json) = serde_json::from_str::<Value>(data) {
+                        // Handle stop reason in message_delta
                         if let Some(stop_reason) = data_json.get("delta").and_then(|d| d.get("stop_reason")).and_then(|s| s.as_str()) {
                             let finish_reason = match stop_reason {
                                 "end_turn" => "stop",
@@ -1014,9 +1044,29 @@ fn transform_anthropic_streaming_chunk(
                             let formatted = format!("data: {}\n\n", serde_json::to_string(&openai_chunk)?);
                             openai_chunks.push(formatted);
                         }
+
+                        // Store final output tokens for later usage chunk
+                        if let Some(usage) = data_json.get("usage") {
+                            let output_tokens = usage.get("output_tokens").and_then(|t| t.as_u64()).unwrap_or(0) as u32;
+                            usage_accumulator.set_final_output_tokens(output_tokens);
+
+                            println!("[{}] [DEBUG] Stored final output_tokens from message_delta: {}", request_id, output_tokens);
+                        }
                     }
                 },
                 Some("message_stop") => {
+                    // Emit final usage chunk before [DONE] if we have complete usage data
+                    if let Some(usage_chunk) = usage_accumulator.create_usage_chunk(request_id, original_model, created) {
+                        openai_chunks.push(usage_chunk);
+                        println!("[{}] [DEBUG] Emitted final complete usage chunk at stream end", request_id);
+                        println!("[{}] [DEBUG] Final usage: prompt={}, completion={}, total={}",
+                            request_id,
+                            usage_accumulator.input_tokens,
+                            usage_accumulator.output_tokens,
+                            usage_accumulator.input_tokens + usage_accumulator.output_tokens
+                        );
+                    }
+
                     // Final chunk
                     openai_chunks.push("data: [DONE]\n\n".to_string());
                 },
@@ -1222,13 +1272,17 @@ async fn handle_openai_chat_impl(
         let request_id_clone = request_id.to_string();
         let state_clone = state.clone();
 
-        // Create a stream that transforms Anthropic chunks to OpenAI format
+        // Create a stream that transforms Anthropic chunks to OpenAI format with stateful usage tracking
+        let usage_accumulator = Arc::new(parking_lot::Mutex::new(StreamingUsageAccumulator::default()));
+        let usage_accumulator_clone = usage_accumulator.clone();
+
         let stream = response.bytes_stream().map(move |chunk_result| {
             match chunk_result {
                 Ok(chunk) => {
                     state_clone.log_debug(format!("[{}] [DEBUG] Processing chunk: {} bytes", request_id_clone, chunk.len()));
 
-                    match transform_anthropic_streaming_chunk(&chunk, &request_id_clone, &original_model, created) {
+                    let mut accumulator = usage_accumulator_clone.lock();
+                    match transform_anthropic_streaming_chunk(&chunk, &request_id_clone, &original_model, created, &mut *accumulator) {
                         Ok(openai_chunks) => {
                             state_clone.log_debug(format!("[{}] [DEBUG] Transformed to {} OpenAI chunks", request_id_clone, openai_chunks.len()));
                             let combined = openai_chunks.join("");
@@ -1276,6 +1330,14 @@ async fn handle_openai_chat_impl(
                 match transform_anthropic_to_openai(&anthropic_response, &openai_request.model, &request_id) {
                     Ok(openai_response) => {
                         state.log_info(format!("[{}] Successfully transformed to OpenAI format", request_id));
+
+                        // Debug log the transformed usage
+                        println!("[{}] [DEBUG] Transformed OpenAI response usage: prompt={}, completion={}, total={}",
+                            request_id,
+                            openai_response.usage.prompt_tokens,
+                            openai_response.usage.completion_tokens,
+                            openai_response.usage.total_tokens
+                        );
 
                         // Debug logging for transformed OpenAI response
                         match serde_json::to_string_pretty(&openai_response) {
@@ -1513,6 +1575,10 @@ fn transform_anthropic_to_openai(anthropic_response: &Value, original_model: &st
         .and_then(|u| u.get("output_tokens"))
         .and_then(|t| t.as_u64())
         .unwrap_or(0) as u32;
+
+    // Debug log usage information
+    println!("[{}] [DEBUG] Non-streaming response usage: prompt={}, completion={}, total={}",
+        request_id, prompt_tokens, completion_tokens, prompt_tokens + completion_tokens);
 
     // Determine finish reason with more comprehensive mapping
     let stop_reason = anthropic_response

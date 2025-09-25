@@ -4,6 +4,7 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::time::Duration;
 use url::Url;
 use webbrowser;
 
@@ -175,5 +176,37 @@ impl OAuthManager {
 
         let token_response: TokenResponse = response.json().await?;
         Ok(token_response)
+    }
+
+    /// Refresh access token with retry mechanism and exponential backoff
+    pub async fn refresh_token_with_retry(&self, refresh_token: &str, max_retries: usize) -> Result<TokenResponse> {
+        let mut last_error = None;
+
+        for attempt in 1..=max_retries {
+            println!("[OAuth] Attempting token refresh (attempt {}/{})", attempt, max_retries);
+
+            match self.refresh_token(refresh_token).await {
+                Ok(token_response) => {
+                    println!("[OAuth] ✓ Token refresh successful on attempt {}", attempt);
+                    return Ok(token_response);
+                }
+                Err(e) => {
+                    let error_msg = e.to_string();
+                    println!("[OAuth] ✗ Token refresh failed on attempt {}: {}", attempt, error_msg);
+                    last_error = Some(e);
+
+                    // If this isn't the last attempt, wait before retrying
+                    if attempt < max_retries {
+                        let delay_seconds = 2_u64.pow(attempt as u32 - 1); // Exponential backoff: 1s, 2s, 4s...
+                        println!("[OAuth] Waiting {} seconds before retry...", delay_seconds);
+                        tokio::time::sleep(Duration::from_secs(delay_seconds)).await;
+                    }
+                }
+            }
+        }
+
+        let final_error = last_error.unwrap_or_else(|| anyhow!("Token refresh failed after {} attempts", max_retries));
+        println!("[OAuth] ✗ All token refresh attempts failed. Final error: {}", final_error);
+        Err(final_error)
     }
 }

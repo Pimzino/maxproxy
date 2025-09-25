@@ -12,6 +12,14 @@ export interface TokenStatus {
   time_until_expiry: string;
 }
 
+export interface InitStatus {
+  tokens_checked: boolean;
+  token_refresh_attempted: boolean;
+  token_refresh_successful: boolean;
+  initialization_complete: boolean;
+  error: string | null;
+}
+
 export interface ProxyConfig {
   port: number;
   bind_address: string;
@@ -32,4 +40,5 @@ export interface AppState {
   proxyConfig: ProxyConfig | null;
   proxyRunning: boolean;
   logs: LogEntry[];
+  initStatus: InitStatus | null;
 }

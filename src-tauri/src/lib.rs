@@ -16,6 +16,17 @@ use storage::{TokenStatus, TokenStorage};
 pub struct AppState {
     oauth_manager: Arc<Mutex<OAuthManager>>,
     proxy_server: Arc<ProxyServer>,
+    init_status: Arc<Mutex<InitStatus>>,
+}
+
+// App initialization status
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InitStatus {
+    pub tokens_checked: bool,
+    pub token_refresh_attempted: bool,
+    pub token_refresh_successful: bool,
+    pub initialization_complete: bool,
+    pub error: Option<String>,
 }
 
 // Tauri command results
@@ -42,6 +53,89 @@ impl<T> CommandResult<T> {
             error: Some(error),
         }
     }
+}
+
+// Automatic token renewal on startup
+async fn initialize_tokens_with_auto_renewal(
+    oauth_manager: Arc<Mutex<OAuthManager>>,
+    token_storage: &TokenStorage,
+) -> InitStatus {
+    let mut status = InitStatus {
+        tokens_checked: false,
+        token_refresh_attempted: false,
+        token_refresh_successful: false,
+        initialization_complete: false,
+        error: None,
+    };
+
+    println!("[TokenInit] Starting token initialization and auto-renewal check...");
+
+    // Check if tokens exist and their status
+    match token_storage.get_status() {
+        Ok(token_status) => {
+            status.tokens_checked = true;
+            println!("[TokenInit] Token status checked - has_tokens: {}, is_expired: {}",
+                token_status.has_tokens, token_status.is_expired);
+
+            // If we have tokens and they're expired, try to refresh them
+            if token_status.has_tokens && token_status.is_expired {
+                println!("[TokenInit] Tokens are expired, attempting automatic renewal...");
+                status.token_refresh_attempted = true;
+
+                match token_storage.get_refresh_token() {
+                    Ok(Some(refresh_token)) => {
+                        let oauth_manager = oauth_manager.lock().await;
+
+                        // Use retry mechanism with 3 attempts
+                        match oauth_manager.refresh_token_with_retry(&refresh_token, 3).await {
+                            Ok(new_tokens) => {
+                                // Save the new tokens
+                                match token_storage.save_tokens(&new_tokens) {
+                                    Ok(_) => {
+                                        status.token_refresh_successful = true;
+                                        println!("[TokenInit] ✓ Token renewal successful! Application ready.");
+                                    }
+                                    Err(e) => {
+                                        let error_msg = format!("Failed to save refreshed tokens: {}", e);
+                                        println!("[TokenInit] ✗ {}", error_msg);
+                                        status.error = Some(error_msg);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                let error_msg = format!("All token refresh attempts failed: {}", e);
+                                println!("[TokenInit] ✗ {}", error_msg);
+                                status.error = Some(error_msg);
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        let error_msg = "No refresh token available for automatic renewal".to_string();
+                        println!("[TokenInit] ✗ {}", error_msg);
+                        status.error = Some(error_msg);
+                    }
+                    Err(e) => {
+                        let error_msg = format!("Failed to retrieve refresh token: {}", e);
+                        println!("[TokenInit] ✗ {}", error_msg);
+                        status.error = Some(error_msg);
+                    }
+                }
+            } else if token_status.has_tokens && !token_status.is_expired {
+                println!("[TokenInit] ✓ Valid tokens found, no renewal needed.");
+            } else {
+                println!("[TokenInit] ℹ No tokens found, user will need to authenticate.");
+            }
+        }
+        Err(e) => {
+            let error_msg = format!("Failed to check token status: {}", e);
+            println!("[TokenInit] ✗ {}", error_msg);
+            status.error = Some(error_msg);
+        }
+    }
+
+    status.initialization_complete = true;
+    println!("[TokenInit] Token initialization complete.");
+    status
 }
 
 // OAuth Commands
@@ -179,6 +273,15 @@ async fn clear_logs(
     Ok(CommandResult::success(()))
 }
 
+// Initialization Commands
+#[tauri::command]
+async fn get_init_status(
+    state: tauri::State<'_, AppState>,
+) -> Result<CommandResult<InitStatus>, tauri::Error> {
+    let init_status = state.init_status.lock().await;
+    Ok(CommandResult::success(init_status.clone()))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Initialize application state
@@ -197,9 +300,19 @@ pub fn run() {
     let oauth_manager = Arc::new(Mutex::new(OAuthManager::new()));
     let proxy_server = Arc::new(ProxyServer::new(token_storage, oauth_manager.clone()));
 
+    // Initialize the app state with default init status
+    let init_status = Arc::new(Mutex::new(InitStatus {
+        tokens_checked: false,
+        token_refresh_attempted: false,
+        token_refresh_successful: false,
+        initialization_complete: false,
+        error: None,
+    }));
+
     let app_state = AppState {
-        oauth_manager,
-        proxy_server,
+        oauth_manager: oauth_manager.clone(),
+        proxy_server: proxy_server.clone(),
+        init_status: init_status.clone(),
     };
 
     tauri::Builder::default()
@@ -219,9 +332,28 @@ pub fn run() {
             get_proxy_config,
             update_proxy_config,
             get_logs,
-            clear_logs
+            clear_logs,
+            get_init_status
         ])
         .setup(|app| {
+            // Perform token initialization asynchronously
+            let app_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let app_state = app_handle.state::<AppState>();
+                let token_storage = &app_state.proxy_server.token_storage;
+                let oauth_manager = app_state.oauth_manager.clone();
+                let init_status_arc = app_state.init_status.clone();
+
+                // Run token initialization with auto-renewal
+                let status = initialize_tokens_with_auto_renewal(oauth_manager, token_storage).await;
+
+                // Update the shared init status
+                {
+                    let mut init_status = init_status_arc.lock().await;
+                    *init_status = status;
+                }
+            });
+
             #[cfg(debug_assertions)]
             {
                 let webview_window = app.get_webview_window("main").unwrap();

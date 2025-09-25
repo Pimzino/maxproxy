@@ -44,11 +44,51 @@ function AppContent() {
 
   // Show loading screen while initializing
   if (!isInitialized) {
+    const getLoadingMessage = () => {
+      const initStatus = state.initStatus;
+
+      if (!initStatus) {
+        return "Initializing application...";
+      }
+
+      if (!initStatus.tokens_checked) {
+        return "Checking authentication status...";
+      }
+
+      if (initStatus.token_refresh_attempted && !initStatus.initialization_complete) {
+        return "Refreshing authentication tokens...";
+      }
+
+      if (initStatus.token_refresh_successful) {
+        return "Authentication refreshed successfully!";
+      }
+
+      if (initStatus.error && initStatus.initialization_complete) {
+        return "Authentication refresh failed, redirecting...";
+      }
+
+      return "Finalizing initialization...";
+    };
+
     return (
       <div className="flex items-center justify-center min-h-screen">
-        <div className="text-center">
+        <div className="text-center max-w-md">
           <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-gray-900 dark:border-gray-100 mx-auto"></div>
-          <p className="mt-2 text-gray-600 dark:text-gray-400">Loading...</p>
+          <p className="mt-4 text-gray-600 dark:text-gray-400 font-medium">
+            {getLoadingMessage()}
+          </p>
+
+          {state.initStatus?.token_refresh_attempted && !state.initStatus.initialization_complete && (
+            <p className="mt-2 text-sm text-gray-500 dark:text-gray-500">
+              Please wait while we attempt to refresh your tokens...
+            </p>
+          )}
+
+          {state.initStatus?.error && (
+            <p className="mt-3 text-sm text-red-600 dark:text-red-400">
+              {state.initStatus.error}
+            </p>
+          )}
         </div>
       </div>
     );
