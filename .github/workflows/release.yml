@@ -7,6 +7,19 @@ on:
         description: 'Release version (e.g., v1.0.0)'
         required: true
         default: 'v0.1.0'
+      release_notes:
+        description: 'Release notes or changelog details'
+        required: false
+        default: |
+          ## What's Changed
+          - Build for Windows, macOS, and Linux
+
+          ## Installation
+          - **Windows**: Download and run the `.msi` installer
+          - **macOS**: Download and open the `.dmg` file
+          - **Linux**: Download the `.deb` package or `.AppImage`
+
+          See the [Assets](#assets) section below for all available downloads.
 
 jobs:
   release:
@@ -66,15 +79,7 @@ jobs:
           releaseBody: |
             Release ${{ github.event.inputs.version }} of MaxProxy
 
-            ## What's Changed
-            - Build for Windows, macOS, and Linux
-
-            ## Installation
-            - **Windows**: Download and run the `.msi` installer
-            - **macOS**: Download and open the `.dmg` file
-            - **Linux**: Download the `.deb` package or `.AppImage`
-
-            See the [Assets](#assets) section below for all available downloads.
+            ${{ github.event.inputs.release_notes }}
           releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}
