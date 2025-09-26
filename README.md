@@ -1,21 +1,30 @@
-# Tauri + React + Typescript
+# MaxProxy
 
-This template should help get you started developing with Tauri, React and Typescript in Vite.
+MaxProxy is a desktop companion for Claude Max/Pro subscribers. It authenticates with Anthropic and exposes a local endpoint for the Claude Messages API, with an optional OpenAI-compatible bridge for tooling that expects that format.
 
-## Recommended IDE Setup
+## Features
+- Guided Claude OAuth sign-in with automatic token validation.
+- One-click start and stop controls for the bundled proxy server.
+- Local Anthropic endpoint plus OpenAI-style compatibility mode for popular clients.
+- Built-in issue reporter.
 
-- [VS Code](https://code.visualstudio.com/) + [Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode) + [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer)
+## Using MaxProxy
+1. Launch the app and complete the Claude login flow when prompted.
+2. Start the proxy from the dashboard and confirm the status indicator shows **Running**.
+3. Point your Anthropic client—or any OpenAI-style tool using the bridge—at the displayed local URL with any placeholder API key.
 
-## About Page Configuration
+## Disclaimer
+EDUCATIONAL USE ONLY
 
-You can configure the About page via environment variables (Vite reads `VITE_*`):
+MaxProxy is an independent project created for learning and experimentation. It is not sponsored, endorsed, or approved by Anthropic.
 
-- `VITE_GITHUB_REPO_URL` — GitHub repository URL (e.g. `https://github.com/yourname/maxproxy`). Enables the “Open GitHub” button and directs the “Log an Issue” modal to your repo’s new issue page.
-- `VITE_APP_DISCLAIMER` — Optional custom disclaimer text to display on the About page.
+Key considerations:
+- Relies on reverse-engineered Claude Code OAuth flows that may break or change without warning.
+- Could violate Anthropic's Terms of Service or other agreements.
+- Provides no warranty, guarantee, or support.
+- May expose you to data loss, security issues, or account actions.
+- Operation can stop at any time without notice.
 
-Create a `.env.local` file in the project root with values, for example:
+By using MaxProxy you accept full responsibility for any consequences, including policy breaches, downtime, or security incidents.
 
-```
-VITE_GITHUB_REPO_URL=https://github.com/yourname/maxproxy
-VITE_APP_DISCLAIMER=MaxProxy is provided as-is without warranty.
-```
+For dependable access, use Claude Code or Anthropic's official APIs with console-issued API keys.
