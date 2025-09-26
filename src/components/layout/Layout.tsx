@@ -6,11 +6,13 @@ import {
   Settings,
   FileText,
   Moon,
-  Sun
+  Sun,
+  Info,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { cn } from '@/lib/utils';
+import { APP_VERSION } from '@/lib/app-version';
 
 interface LayoutProps {
   darkMode: boolean;
@@ -46,6 +48,12 @@ const Layout: React.FC<LayoutProps> = ({ darkMode, onToggleDarkMode, proxyRunnin
       icon: FileText,
       label: 'Logs',
       description: 'View server logs'
+    },
+    {
+      path: '/about',
+      icon: Info,
+      label: 'About',
+      description: 'Version, links, disclaimer'
     }
   ];
 
@@ -58,7 +66,6 @@ const Layout: React.FC<LayoutProps> = ({ darkMode, onToggleDarkMode, proxyRunnin
           <div className="flex items-center justify-between">
             <div>
               <h1 className="text-lg font-semibold">MaxProxy</h1>
-              <p className="text-xs text-muted-foreground">Anthropic API Proxy</p>
             </div>
             <div className="flex items-center gap-2">
               <Badge
@@ -102,7 +109,7 @@ const Layout: React.FC<LayoutProps> = ({ darkMode, onToggleDarkMode, proxyRunnin
         <div className="p-4 border-t">
           <div className="flex items-center justify-between">
             <div className="text-xs text-muted-foreground">
-              v1.0.0
+              v{APP_VERSION}
             </div>
             <Button
               variant="ghost"

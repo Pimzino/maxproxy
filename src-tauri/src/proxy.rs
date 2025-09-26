@@ -7,13 +7,14 @@ use axum::{
     Json, Router,
 };
 use chrono;
+use chrono::{Duration as ChronoDuration, Utc};
 use futures_util::StreamExt;
 use parking_lot::{Mutex, RwLock};
-use tokio::sync::Mutex as TokioMutex;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
+    collections::HashMap,
     net::SocketAddr,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -22,12 +23,13 @@ use std::{
     time::Duration,
 };
 use tokio::net::TcpListener;
+use tokio::sync::Mutex as TokioMutex;
 use tower::ServiceBuilder;
 use tower_http::cors::{Any, CorsLayer};
 use uuid::Uuid;
 
-use crate::storage::TokenStorage;
 use crate::oauth::OAuthManager;
+use crate::storage::TokenStorage;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum LogLevel {
@@ -46,7 +48,8 @@ pub struct LogEntry {
 
 // Anthropic API configuration (hardcoded - not user configurable)
 const ANTHROPIC_VERSION: &str = "2023-06-01";
-const ANTHROPIC_BETA: &str = "claude-code-20250219,oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14";
+const ANTHROPIC_BETA: &str =
+    "claude-code-20250219,oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14";
 const API_BASE: &str = "https://api.anthropic.com";
 const REQUEST_TIMEOUT: u64 = 120;
 
@@ -104,6 +107,8 @@ pub struct AnthropicMessageRequest {
     pub thinking: Option<ThinkingParameter>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<Value>,
 }
 
 // OpenAI API Types
@@ -113,50 +118,15 @@ pub struct OpenAIMessage {
     pub content: Value, // Can be string or array of content parts
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<OpenAIToolCall>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function_call: Option<OpenAIMessageFunctionCall>,
 }
 
 impl OpenAIMessage {
-    /// Extract text content from either string or array format
-    pub fn get_text_content(&self) -> String {
-        match &self.content {
-            Value::String(text) => text.clone(),
-            Value::Array(parts) => {
-                let mut text_parts = Vec::new();
-                for part in parts {
-                    match part {
-                        Value::String(text) => {
-                            text_parts.push(text.clone());
-                        },
-                        Value::Object(obj) => {
-                            // Handle objects with text field
-                            if let Some(Value::String(text)) = obj.get("text") {
-                                text_parts.push(text.clone());
-                            }
-                            // Also check for type="text" pattern
-                            else if let (Some(Value::String(part_type)), Some(Value::String(text))) =
-                                (obj.get("type"), obj.get("text")) {
-                                if part_type == "text" {
-                                    text_parts.push(text.clone());
-                                }
-                            }
-                        },
-                        _ => {} // Skip other types
-                    }
-                }
-                text_parts.join(" ")
-            },
-            Value::Object(obj) => {
-                // Handle single object with text field
-                if let Some(Value::String(text)) = obj.get("text") {
-                    text.clone()
-                } else {
-                    String::new()
-                }
-            },
-            _ => String::new(), // Fallback for other types
-        }
-    }
-
     /// Extract content in Anthropic format (array of content objects)
     pub fn get_anthropic_content(&self) -> Value {
         match &self.content {
@@ -166,7 +136,7 @@ impl OpenAIMessage {
                     "type": "text",
                     "text": text
                 }])
-            },
+            }
             Value::Array(parts) => {
                 let mut anthropic_parts = Vec::new();
                 for part in parts {
@@ -176,30 +146,28 @@ impl OpenAIMessage {
                                 "type": "text",
                                 "text": text
                             }));
-                        },
+                        }
                         Value::Object(obj) => {
                             // Preserve the object structure, ensuring it has type and text
                             let mut anthropic_obj = json!({
                                 "type": "text"
                             });
 
-                            // Copy all fields from the original object
                             if let Value::Object(anthropic_map) = &mut anthropic_obj {
                                 for (key, value) in obj {
                                     anthropic_map.insert(key.clone(), value.clone());
                                 }
-                                // Ensure type is set to "text" if not already present
                                 if !anthropic_map.contains_key("type") {
                                     anthropic_map.insert("type".to_string(), json!("text"));
                                 }
                             }
                             anthropic_parts.push(anthropic_obj);
-                        },
+                        }
                         _ => {} // Skip other types
                     }
                 }
                 Value::Array(anthropic_parts)
-            },
+            }
             Value::Object(obj) => {
                 // Single object -> wrap in array
                 let mut anthropic_obj = json!({
@@ -215,7 +183,7 @@ impl OpenAIMessage {
                     }
                 }
                 json!([anthropic_obj])
-            },
+            }
             _ => {
                 // Fallback -> empty text
                 json!([{
@@ -228,10 +196,33 @@ impl OpenAIMessage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenAIMessageFunctionCall {
+    pub name: String,
+    pub arguments: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenAIFunction {
     pub name: String,
     pub description: Option<String>,
     pub parameters: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenAIToolCallFunction {
+    pub name: String,
+    pub arguments: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenAIToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub call_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function: Option<OpenAIToolCallFunction>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -241,17 +232,55 @@ pub enum OpenAIFunctionCall {
     Named { name: String },
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct OpenAIToolCallDeltaFunction {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct OpenAIToolCallDelta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub call_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function: Option<OpenAIToolCallDeltaFunction>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct OpenAIMessageFunctionCallDelta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenAITool {
     #[serde(rename = "type")]
     pub tool_type: String, // "function"
-    pub function: OpenAIFunction,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function: Option<OpenAIFunction>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub include_usage: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum OpenAIStop {
+    Single(String),
+    Multiple(Vec<String>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -271,7 +300,7 @@ pub struct OpenAIRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub stop: Option<Vec<String>>,
+    pub stop: Option<OpenAIStop>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub n: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -299,15 +328,20 @@ pub struct OpenAIUsage {
 pub struct OpenAIChoice {
     pub index: u32,
     pub message: OpenAIMessage,
-    pub finish_reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct OpenAIDelta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<OpenAIToolCallDelta>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function_call: Option<OpenAIMessageFunctionCallDelta>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -365,13 +399,15 @@ pub struct ProxyServer {
     client: Client,
     running: Arc<AtomicBool>,
     server_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    token_refresh_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     logs: Arc<Mutex<Vec<LogEntry>>>,
 }
 
 impl ProxyServer {
     pub fn new(token_storage: TokenStorage, oauth_manager: Arc<TokioMutex<OAuthManager>>) -> Self {
         // Load saved configuration or use defaults
-        let initial_config = token_storage.load_config()
+        let initial_config = token_storage
+            .load_config()
             .unwrap_or(None)
             .unwrap_or_else(ProxyConfig::default);
 
@@ -385,6 +421,7 @@ impl ProxyServer {
                 .expect("Failed to create HTTP client"),
             running: Arc::new(AtomicBool::new(false)),
             server_handle: Arc::new(Mutex::new(None)),
+            token_refresh_task: Arc::new(Mutex::new(None)),
             logs: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -432,10 +469,6 @@ impl ProxyServer {
         }
     }
 
-    fn log_error(&self, message: String) {
-        self.log_with_level(LogLevel::Error, message);
-    }
-
     fn log_warning(&self, message: String) {
         self.log_with_level(LogLevel::Warning, message);
     }
@@ -444,71 +477,99 @@ impl ProxyServer {
         self.log_with_level(LogLevel::Info, message);
     }
 
-    fn log_debug(&self, message: String) {
-        // Only log debug messages when debug_mode is enabled
-        let config = self.config.read();
-        if config.debug_mode {
-            drop(config); // Release the lock before calling log_with_level
-            self.log_with_level(LogLevel::Debug, message);
+    /// Cancel any scheduled token refresh task
+    pub fn cancel_token_refresh(&self) {
+        if let Some(handle) = self.token_refresh_task.lock().take() {
+            handle.abort();
         }
     }
 
-    /// Get valid access token with automatic refresh if expired
-    pub async fn get_valid_access_token(&self, request_id: &str) -> Result<Option<String>> {
-        // First try to get current access token
-        match self.token_storage.get_access_token() {
-            Ok(Some(token)) => {
-                // We have a valid token that's not expired
-                return Ok(Some(token));
-            }
-            Ok(None) => {
-                // Token is expired or doesn't exist, try to refresh
-                self.log_info(format!("[{}] Access token expired, attempting automatic refresh...", request_id));
-            }
-            Err(e) => {
-                self.log_error(format!("[{}] Error getting access token: {}", request_id, e));
-                return Err(e);
-            }
-        }
+    /// Schedule automatic token refresh near expiry (60s buffer)
+    pub fn schedule_token_refresh(&self) {
+        // Cancel existing schedule first
+        self.cancel_token_refresh();
 
-        // Try to get refresh token
-        let refresh_token = match self.token_storage.get_refresh_token() {
-            Ok(Some(token)) => token,
-            Ok(None) => {
-                self.log_warning(format!("[{}] No refresh token available", request_id));
-                return Ok(None);
-            }
-            Err(e) => {
-                self.log_error(format!("[{}] Error getting refresh token: {}", request_id, e));
-                return Err(e);
-            }
+        let stored = match self.token_storage.load_tokens() {
+            Ok(Some(t)) => t,
+            _ => return, // nothing to schedule
         };
 
-        // Attempt to refresh tokens
-        let oauth_manager = self.oauth_manager.lock().await;
-        match oauth_manager.refresh_token(&refresh_token).await {
-            Ok(token_response) => {
-                self.log_info(format!("[{}] ✓ Successfully refreshed tokens", request_id));
+        let now = Utc::now();
+        let buffer = ChronoDuration::seconds(60);
+        let mut wait = stored.expires_at - now - buffer;
+        if wait < ChronoDuration::zero() {
+            wait = ChronoDuration::zero();
+        }
 
-                // Save the new tokens
-                match self.token_storage.save_tokens(&token_response) {
-                    Ok(_) => {
-                        self.log_info(format!("[{}] ✓ Saved refreshed tokens", request_id));
-                        Ok(Some(token_response.access_token))
+        let initial_sleep = Duration::from_secs(wait.num_seconds().max(0) as u64);
+        self.log_info(format!(
+            "[Scheduler] Scheduling token refresh in {} seconds (at ~{})",
+            initial_sleep.as_secs(),
+            (now + wait).format("%Y-%m-%d %H:%M:%S UTC")
+        ));
+
+        let token_storage = self.token_storage.clone();
+        let oauth_manager = self.oauth_manager.clone();
+        let logs = self.logs.clone();
+
+        let handle = tokio::spawn(async move {
+            let push_log = |level: LogLevel, msg: String| {
+                let mut l = logs.lock();
+                l.push(LogEntry {
+                    level,
+                    timestamp: chrono::Utc::now().format("%H:%M:%S").to_string(),
+                    message: msg,
+                });
+                let len = l.len();
+                if len > 1000 {
+                    l.drain(0..len - 1000);
+                }
+            };
+
+            let mut sleep_dur = initial_sleep;
+            loop {
+                tokio::time::sleep(sleep_dur).await;
+
+                // Acquire refresh token
+                let refresh_token = match token_storage.get_refresh_token() {
+                    Ok(Some(rt)) => rt,
+                    _ => {
+                        push_log(LogLevel::Warning, "[Scheduler] No refresh token; stopping".to_string());
+                        break;
+                    }
+                };
+
+                // Refresh with retry
+                let mgr = oauth_manager.lock().await;
+                match mgr.refresh_token_with_retry(&refresh_token, 3).await {
+                    Ok(new_tokens) => {
+                        drop(mgr);
+                        match token_storage.save_tokens(&new_tokens) {
+                            Ok(_) => {
+                                push_log(LogLevel::Info, "[Scheduler] ✓ Auto-refreshed tokens".to_string());
+                                // Schedule next cycle based on new expiry
+                                let secs = new_tokens.expires_in.saturating_sub(60) as u64;
+                                sleep_dur = Duration::from_secs(secs);
+                                continue;
+                            }
+                            Err(e) => {
+                                push_log(LogLevel::Error, format!("[Scheduler] ✗ Save tokens failed: {}", e));
+                                break;
+                            }
+                        }
                     }
                     Err(e) => {
-                        self.log_error(format!("[{}] ✗ Failed to save refreshed tokens: {}", request_id, e));
-                        Err(e)
+                        drop(mgr);
+                        push_log(LogLevel::Error, format!("[Scheduler] ✗ Refresh failed: {}", e));
+                        break;
                     }
                 }
             }
-            Err(e) => {
-                self.log_error(format!("[{}] ✗ Failed to refresh token: {}", request_id, e));
-                self.log_info(format!("[{}] Please re-authenticate using the OAuth flow", request_id));
-                Ok(None)
-            }
-        }
+        });
+
+        *self.token_refresh_task.lock() = Some(handle);
     }
+
 
     pub async fn start(&self) -> Result<()> {
         if self.running.load(Ordering::Relaxed) {
@@ -579,8 +640,12 @@ impl ProxyServer {
             .route("/health", get(handle_health))
             .route("/*path", any(handle_fallback))
             .layer(
-                ServiceBuilder::new()
-                    .layer(CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any))
+                ServiceBuilder::new().layer(
+                    CorsLayer::new()
+                        .allow_origin(Any)
+                        .allow_methods(Any)
+                        .allow_headers(Any),
+                ),
             )
             .with_state(state)
     }
@@ -641,10 +706,16 @@ impl ProxyState {
             }
             Ok(None) => {
                 // Token is expired or doesn't exist, try to refresh
-                self.log_info(format!("[{}] Access token expired, attempting automatic refresh...", request_id));
+                self.log_info(format!(
+                    "[{}] Access token expired, attempting automatic refresh...",
+                    request_id
+                ));
             }
             Err(e) => {
-                self.log_error(format!("[{}] Error getting access token: {}", request_id, e));
+                self.log_error(format!(
+                    "[{}] Error getting access token: {}",
+                    request_id, e
+                ));
                 return Err(e);
             }
         }
@@ -657,7 +728,10 @@ impl ProxyState {
                 return Ok(None);
             }
             Err(e) => {
-                self.log_error(format!("[{}] Error getting refresh token: {}", request_id, e));
+                self.log_error(format!(
+                    "[{}] Error getting refresh token: {}",
+                    request_id, e
+                ));
                 return Err(e);
             }
         };
@@ -675,14 +749,20 @@ impl ProxyState {
                         Ok(Some(token_response.access_token))
                     }
                     Err(e) => {
-                        self.log_error(format!("[{}] ✗ Failed to save refreshed tokens: {}", request_id, e));
+                        self.log_error(format!(
+                            "[{}] ✗ Failed to save refreshed tokens: {}",
+                            request_id, e
+                        ));
                         Err(e)
                     }
                 }
             }
             Err(e) => {
                 self.log_error(format!("[{}] ✗ Failed to refresh token: {}", request_id, e));
-                self.log_info(format!("[{}] Please re-authenticate using the OAuth flow", request_id));
+                self.log_info(format!(
+                    "[{}] Please re-authenticate using the OAuth flow",
+                    request_id
+                ));
                 Ok(None)
             }
         }
@@ -700,7 +780,7 @@ fn get_model_metadata(model_id: &str) -> (u32, u32, serde_json::Value) {
         "claude-sonnet-4-20250514" => {
             // Sonnet 4 supports extended context with beta header
             (200000, 8192) // Standard context, can be up to 1M with beta
-        },
+        }
         "claude-3-7-sonnet-20250219" => (200000, 8192),
         "claude-3-5-haiku-20241022" => (200000, 4096),
         "claude-3-haiku-20240307" => (200000, 4096),
@@ -720,19 +800,35 @@ fn get_model_metadata(model_id: &str) -> (u32, u32, serde_json::Value) {
 
     // Check if it's a thinking variant
     if model_id.contains("-thinking-") {
-        capabilities.insert("thinking_enabled".to_string(), serde_json::Value::Bool(true));
+        capabilities.insert(
+            "thinking_enabled".to_string(),
+            serde_json::Value::Bool(true),
+        );
         if let Some(budget) = get_thinking_budget_tokens(model_id) {
-            capabilities.insert("thinking_budget_tokens".to_string(), serde_json::Value::Number(serde_json::Number::from(budget)));
+            capabilities.insert(
+                "thinking_budget_tokens".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(budget)),
+            );
         }
     }
 
     // Extended context support for Sonnet 4
     if base_model == "claude-sonnet-4-20250514" {
-        capabilities.insert("extended_context".to_string(), serde_json::Value::Bool(true));
-        capabilities.insert("max_context_length".to_string(), serde_json::Value::Number(serde_json::Number::from(1000000)));
+        capabilities.insert(
+            "extended_context".to_string(),
+            serde_json::Value::Bool(true),
+        );
+        capabilities.insert(
+            "max_context_length".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(1000000)),
+        );
     }
 
-    (context_length, max_completion_tokens, serde_json::Value::Object(capabilities))
+    (
+        context_length,
+        max_completion_tokens,
+        serde_json::Value::Object(capabilities),
+    )
 }
 
 async fn handle_models(
@@ -751,41 +847,40 @@ async fn handle_models(
         "claude-3-7-sonnet-20250219",
         "claude-3-5-haiku-20241022",
         "claude-3-haiku-20240307",
-
         // Thinking variants for Claude Opus 4.1
         "claude-opus-4-1-20250805-thinking-low",
         "claude-opus-4-1-20250805-thinking-medium",
         "claude-opus-4-1-20250805-thinking-high",
-
         // Thinking variants for Claude Opus 4
         "claude-opus-4-20250514-thinking-low",
         "claude-opus-4-20250514-thinking-medium",
         "claude-opus-4-20250514-thinking-high",
-
         // Thinking variants for Claude Sonnet 4
         "claude-sonnet-4-20250514-thinking-low",
         "claude-sonnet-4-20250514-thinking-medium",
         "claude-sonnet-4-20250514-thinking-high",
-
         // Thinking variants for Claude Sonnet 3.7
         "claude-3-7-sonnet-20250219-thinking-low",
         "claude-3-7-sonnet-20250219-thinking-medium",
         "claude-3-7-sonnet-20250219-thinking-high",
     ];
 
-    let models = model_ids.into_iter().map(|id| {
-        let (context_length, max_completion_tokens, capabilities) = get_model_metadata(id);
+    let models = model_ids
+        .into_iter()
+        .map(|id| {
+            let (context_length, max_completion_tokens, capabilities) = get_model_metadata(id);
 
-        OpenAIModel {
-            id: id.to_string(),
-            object: "model".to_string(),
-            created: 1687882411,
-            owned_by: "anthropic".to_string(),
-            context_length: Some(context_length),
-            max_completion_tokens: Some(max_completion_tokens),
-            capabilities: Some(capabilities),
-        }
-    }).collect();
+            OpenAIModel {
+                id: id.to_string(),
+                object: "model".to_string(),
+                created: 1687882411,
+                owned_by: "anthropic".to_string(),
+                context_length: Some(context_length),
+                max_completion_tokens: Some(max_completion_tokens),
+                capabilities: Some(capabilities),
+            }
+        })
+        .collect();
 
     Ok(Json(OpenAIModelsResponse {
         object: "list".to_string(),
@@ -801,7 +896,8 @@ async fn handle_messages(
     let request_id = Uuid::new_v4().to_string()[..8].to_string();
 
     state.log_info(format!("[{}] Incoming request to /v1/messages", request_id));
-    state.log_info(format!("[{}] Model: {}, Stream: {}",
+    state.log_info(format!(
+        "[{}] Model: {}, Stream: {}",
         request_id,
         request.model,
         request.stream.unwrap_or(false)
@@ -811,11 +907,17 @@ async fn handle_messages(
     let access_token = match state.get_valid_access_token(&request_id).await {
         Ok(Some(token)) => token,
         Ok(None) => {
-            state.log_warning(format!("[{}] No valid access token available - authentication required", request_id));
+            state.log_warning(format!(
+                "[{}] No valid access token available - authentication required",
+                request_id
+            ));
             return Err(StatusCode::UNAUTHORIZED);
-        },
+        }
         Err(e) => {
-            state.log_error(format!("[{}] Token authentication error: {}", request_id, e));
+            state.log_error(format!(
+                "[{}] Token authentication error: {}",
+                request_id, e
+            ));
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
     };
@@ -827,7 +929,8 @@ async fn handle_messages(
     sanitize_anthropic_request(&mut request);
 
     // Build the forwarded request with Claude Code headers
-    let mut req_builder = state.client
+    let mut req_builder = state
+        .client
         .post(&format!("{}/v1/messages?beta=true", API_BASE))
         .header("Authorization", format!("Bearer {}", access_token))
         .header("Content-Type", "application/json")
@@ -866,7 +969,10 @@ async fn handle_messages(
     };
 
     let status = response.status();
-    state.log_info(format!("[{}] Anthropic API responded with: {}", request_id, status));
+    state.log_info(format!(
+        "[{}] Anthropic API responded with: {}",
+        request_id, status
+    ));
 
     if request.stream.unwrap_or(false) {
         // Handle streaming response
@@ -894,14 +1000,21 @@ async fn handle_messages(
 
 // Accumulator for usage information across streaming chunks
 #[derive(Default)]
-struct StreamingUsageAccumulator {
+struct ToolCallStreamState {
+    id: String,
+    arguments: String,
+}
+
+#[derive(Default)]
+struct StreamingTransformState {
     input_tokens: u32,
     output_tokens: u32,
     has_input_tokens: bool,
     has_final_output_tokens: bool,
+    tool_calls: HashMap<usize, ToolCallStreamState>,
 }
 
-impl StreamingUsageAccumulator {
+impl StreamingTransformState {
     fn set_input_tokens(&mut self, tokens: u32) {
         if !self.has_input_tokens {
             self.input_tokens = tokens;
@@ -914,7 +1027,12 @@ impl StreamingUsageAccumulator {
         self.has_final_output_tokens = true;
     }
 
-    fn create_usage_chunk(&self, request_id: &str, original_model: &str, created: u64) -> Option<String> {
+    fn create_usage_chunk(
+        &self,
+        request_id: &str,
+        original_model: &str,
+        created: u64,
+    ) -> Option<String> {
         if self.has_input_tokens && self.has_final_output_tokens {
             let total_tokens = self.input_tokens + self.output_tokens;
             let usage_chunk = serde_json::json!({
@@ -930,10 +1048,38 @@ impl StreamingUsageAccumulator {
                 }
             });
 
-            Some(format!("data: {}\n\n", serde_json::to_string(&usage_chunk).unwrap()))
+            Some(format!(
+                "data: {}
+
+",
+                serde_json::to_string(&usage_chunk).unwrap()
+            ))
         } else {
             None
         }
+    }
+
+    fn start_tool_call(&mut self, index: usize, id: String) {
+        self.tool_calls.insert(
+            index,
+            ToolCallStreamState {
+                id,
+                arguments: String::new(),
+            },
+        );
+    }
+
+    fn append_tool_arguments(&mut self, index: usize, partial: &str) -> Option<(String, String)> {
+        if let Some(state) = self.tool_calls.get_mut(&index) {
+            state.arguments.push_str(partial);
+            Some((state.id.clone(), partial.to_string()))
+        } else {
+            None
+        }
+    }
+
+    fn end_tool_call(&mut self, index: usize) {
+        self.tool_calls.remove(&index);
     }
 }
 
@@ -943,14 +1089,17 @@ fn transform_anthropic_streaming_chunk(
     request_id: &str,
     original_model: &str,
     created: u64,
-    usage_accumulator: &mut StreamingUsageAccumulator,
-    include_usage: bool
+    state: &mut StreamingTransformState,
+    include_usage: bool,
 ) -> Result<Vec<String>, anyhow::Error> {
     let chunk_str = std::str::from_utf8(chunk)?;
     let mut openai_chunks = Vec::new();
 
-    // Parse SSE format - split by double newlines for events
-    for event_block in chunk_str.split("\n\n") {
+    for event_block in chunk_str.split(
+        "
+
+",
+    ) {
         if event_block.trim().is_empty() {
             continue;
         }
@@ -958,7 +1107,6 @@ fn transform_anthropic_streaming_chunk(
         let mut event_type = None;
         let mut data_content = None;
 
-        // Parse SSE fields
         for line in event_block.lines() {
             if let Some(stripped) = line.strip_prefix("event: ") {
                 event_type = Some(stripped);
@@ -980,28 +1128,69 @@ fn transform_anthropic_streaming_chunk(
                                 index: 0,
                                 delta: OpenAIDelta {
                                     role: Some("assistant".to_string()),
-                                    content: Some("".to_string()),
+                                    content: Some(String::new()),
+                                    ..Default::default()
                                 },
                                 finish_reason: None,
                             }],
                         };
 
-                        let formatted = format!("data: {}\n\n", serde_json::to_string(&openai_chunk)?);
-                        openai_chunks.push(formatted);
+                        openai_chunks.push(format!(
+                            "data: {}
 
-                        // Store input tokens for later usage chunk
+",
+                            serde_json::to_string(&openai_chunk)?
+                        ));
+
                         if let Some(usage) = data_json.get("message").and_then(|m| m.get("usage")) {
-                            let input_tokens = usage.get("input_tokens").and_then(|t| t.as_u64()).unwrap_or(0) as u32;
-                            usage_accumulator.set_input_tokens(input_tokens);
+                            let input_tokens = usage
+                                .get("input_tokens")
+                                .and_then(|t| t.as_u64())
+                                .unwrap_or(0) as u32;
+                            state.set_input_tokens(input_tokens);
 
-                            println!("[{}] [DEBUG] Stored input_tokens from message_start: {}", request_id, input_tokens);
+                            println!(
+                                "[{}] [DEBUG] Stored input_tokens from message_start: {}",
+                                request_id, input_tokens
+                            );
                         }
                     }
-                },
-                Some("content_block_delta") => {
+                }
+                Some("content_block_start") => {
                     if let Ok(data_json) = serde_json::from_str::<Value>(data) {
-                        if let Some(delta) = data_json.get("delta") {
-                            if let Some(text) = delta.get("text").and_then(|t| t.as_str()) {
+                        let index =
+                            data_json.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                        if let Some(content_block) = data_json.get("content_block") {
+                            if content_block.get("type").and_then(|t| t.as_str())
+                                == Some("tool_use")
+                            {
+                                let tool_id = content_block
+                                    .get("id")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.to_string())
+                                    .unwrap_or_else(|| {
+                                        format!("tool_call_{}", Uuid::new_v4().simple())
+                                    });
+                                let tool_name = content_block
+                                    .get("name")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.to_string())
+                                    .unwrap_or_default();
+                                state.start_tool_call(index, tool_id.clone());
+
+                                let delta = OpenAIDelta {
+                                    tool_calls: Some(vec![OpenAIToolCallDelta {
+                                        id: Some(tool_id.clone()),
+                                        call_type: Some("function".to_string()),
+                                        function: Some(OpenAIToolCallDeltaFunction {
+                                            name: Some(tool_name.clone()),
+                                            arguments: Some(String::new()),
+                                        }),
+                                        extra: HashMap::new(),
+                                    }]),
+                                    ..Default::default()
+                                };
+
                                 let openai_chunk = OpenAIStreamResponse {
                                     id: format!("chatcmpl-{}", request_id),
                                     object: "chat.completion.chunk".to_string(),
@@ -1009,24 +1198,192 @@ fn transform_anthropic_streaming_chunk(
                                     model: original_model.to_string(),
                                     choices: vec![OpenAIChoiceDelta {
                                         index: 0,
-                                        delta: OpenAIDelta {
-                                            role: None,
-                                            content: Some(text.to_string()),
-                                        },
+                                        delta,
                                         finish_reason: None,
                                     }],
                                 };
 
-                                let formatted = format!("data: {}\n\n", serde_json::to_string(&openai_chunk)?);
-                                openai_chunks.push(formatted);
+                                openai_chunks.push(format!(
+                                    "data: {}
+
+",
+                                    serde_json::to_string(&openai_chunk)?
+                                ));
+
+                                if let Some(input_value) = content_block.get("input") {
+                                    if !input_value.is_null() {
+                                        let arguments =
+                                            serde_json::to_string(input_value).unwrap_or_default();
+                                        if !arguments.is_empty() && arguments != "{}" {
+                                            if let Some((tool_id_append, append_value)) =
+                                                state.append_tool_arguments(index, &arguments)
+                                            {
+                                                let delta = OpenAIDelta {
+                                                    tool_calls: Some(vec![OpenAIToolCallDelta {
+                                                        id: Some(tool_id_append),
+                                                        call_type: None,
+                                                        function: Some(
+                                                            OpenAIToolCallDeltaFunction {
+                                                                name: None,
+                                                                arguments: Some(append_value),
+                                                            },
+                                                        ),
+                                                        extra: HashMap::new(),
+                                                    }]),
+                                                    ..Default::default()
+                                                };
+
+                                                let openai_chunk = OpenAIStreamResponse {
+                                                    id: format!("chatcmpl-{}", request_id),
+                                                    object: "chat.completion.chunk".to_string(),
+                                                    created,
+                                                    model: original_model.to_string(),
+                                                    choices: vec![OpenAIChoiceDelta {
+                                                        index: 0,
+                                                        delta,
+                                                        finish_reason: None,
+                                                    }],
+                                                };
+
+                                                openai_chunks.push(format!(
+                                                    "data: {}
+
+",
+                                                    serde_json::to_string(&openai_chunk)?
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
-                },
+                }
+                Some("content_block_delta") => {
+                    if let Ok(data_json) = serde_json::from_str::<Value>(data) {
+                        let index =
+                            data_json.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                        if let Some(delta) = data_json.get("delta") {
+                            if let Some(text) = delta.get("text").and_then(|t| t.as_str()) {
+                                let delta_value = OpenAIDelta {
+                                    content: Some(text.to_string()),
+                                    ..Default::default()
+                                };
+                                let openai_chunk = OpenAIStreamResponse {
+                                    id: format!("chatcmpl-{}", request_id),
+                                    object: "chat.completion.chunk".to_string(),
+                                    created,
+                                    model: original_model.to_string(),
+                                    choices: vec![OpenAIChoiceDelta {
+                                        index: 0,
+                                        delta: delta_value,
+                                        finish_reason: None,
+                                    }],
+                                };
+                                openai_chunks.push(format!(
+                                    "data: {}
+
+",
+                                    serde_json::to_string(&openai_chunk)?
+                                ));
+                            }
+
+                            if let Some(partial_json) =
+                                delta.get("partial_json").and_then(|t| t.as_str())
+                            {
+                                if let Some((tool_id, append_value)) =
+                                    state.append_tool_arguments(index, partial_json)
+                                {
+                                    let delta_value = OpenAIDelta {
+                                        tool_calls: Some(vec![OpenAIToolCallDelta {
+                                            id: Some(tool_id),
+                                            call_type: None,
+                                            function: Some(OpenAIToolCallDeltaFunction {
+                                                name: None,
+                                                arguments: Some(append_value),
+                                            }),
+                                            extra: HashMap::new(),
+                                        }]),
+                                        ..Default::default()
+                                    };
+
+                                    let openai_chunk = OpenAIStreamResponse {
+                                        id: format!("chatcmpl-{}", request_id),
+                                        object: "chat.completion.chunk".to_string(),
+                                        created,
+                                        model: original_model.to_string(),
+                                        choices: vec![OpenAIChoiceDelta {
+                                            index: 0,
+                                            delta: delta_value,
+                                            finish_reason: None,
+                                        }],
+                                    };
+
+                                    openai_chunks.push(format!(
+                                        "data: {}
+
+",
+                                        serde_json::to_string(&openai_chunk)?
+                                    ));
+                                }
+                            }
+
+                            if let Some(input_json) = delta.get("input_json") {
+                                let arguments =
+                                    serde_json::to_string(input_json).unwrap_or_default();
+                                if !arguments.is_empty() {
+                                    if let Some((tool_id, append_value)) =
+                                        state.append_tool_arguments(index, &arguments)
+                                    {
+                                        let delta_value = OpenAIDelta {
+                                            tool_calls: Some(vec![OpenAIToolCallDelta {
+                                                id: Some(tool_id),
+                                                call_type: None,
+                                                function: Some(OpenAIToolCallDeltaFunction {
+                                                    name: None,
+                                                    arguments: Some(append_value),
+                                                }),
+                                                extra: HashMap::new(),
+                                            }]),
+                                            ..Default::default()
+                                        };
+                                        let openai_chunk = OpenAIStreamResponse {
+                                            id: format!("chatcmpl-{}", request_id),
+                                            object: "chat.completion.chunk".to_string(),
+                                            created,
+                                            model: original_model.to_string(),
+                                            choices: vec![OpenAIChoiceDelta {
+                                                index: 0,
+                                                delta: delta_value,
+                                                finish_reason: None,
+                                            }],
+                                        };
+                                        openai_chunks.push(format!(
+                                            "data: {}
+
+",
+                                            serde_json::to_string(&openai_chunk)?
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Some("content_block_stop") => {
+                    if let Ok(data_json) = serde_json::from_str::<Value>(data) {
+                        let index =
+                            data_json.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                        state.end_tool_call(index);
+                    }
+                }
                 Some("message_delta") => {
                     if let Ok(data_json) = serde_json::from_str::<Value>(data) {
-                        // Handle stop reason in message_delta
-                        if let Some(stop_reason) = data_json.get("delta").and_then(|d| d.get("stop_reason")).and_then(|s| s.as_str()) {
+                        if let Some(stop_reason) = data_json
+                            .get("delta")
+                            .and_then(|d| d.get("stop_reason"))
+                            .and_then(|s| s.as_str())
+                        {
                             let finish_reason = match stop_reason {
                                 "end_turn" => "stop",
                                 "max_tokens" => "length",
@@ -1042,49 +1399,65 @@ fn transform_anthropic_streaming_chunk(
                                 model: original_model.to_string(),
                                 choices: vec![OpenAIChoiceDelta {
                                     index: 0,
-                                    delta: OpenAIDelta {
-                                        role: None,
-                                        content: None,
-                                    },
+                                    delta: OpenAIDelta::default(),
                                     finish_reason: Some(finish_reason.to_string()),
                                 }],
                             };
 
-                            let formatted = format!("data: {}\n\n", serde_json::to_string(&openai_chunk)?);
-                            openai_chunks.push(formatted);
+                            openai_chunks.push(format!(
+                                "data: {}
+
+",
+                                serde_json::to_string(&openai_chunk)?
+                            ));
                         }
 
-                        // Store final output tokens for later usage chunk
                         if let Some(usage) = data_json.get("usage") {
-                            let output_tokens = usage.get("output_tokens").and_then(|t| t.as_u64()).unwrap_or(0) as u32;
-                            usage_accumulator.set_final_output_tokens(output_tokens);
+                            let output_tokens = usage
+                                .get("output_tokens")
+                                .and_then(|t| t.as_u64())
+                                .unwrap_or(0)
+                                as u32;
+                            state.set_final_output_tokens(output_tokens);
 
-                            println!("[{}] [DEBUG] Stored final output_tokens from message_delta: {}", request_id, output_tokens);
+                            println!(
+                                "[{}] [DEBUG] Stored final output_tokens from message_delta: {}",
+                                request_id, output_tokens
+                            );
                         }
                     }
-                },
+                }
                 Some("message_stop") => {
-                    // Only emit final usage chunk if explicitly requested via stream_options.include_usage
                     if include_usage {
-                        if let Some(usage_chunk) = usage_accumulator.create_usage_chunk(request_id, original_model, created) {
+                        if let Some(usage_chunk) =
+                            state.create_usage_chunk(request_id, original_model, created)
+                        {
                             openai_chunks.push(usage_chunk);
                             println!("[{}] [DEBUG] Emitted final complete usage chunk at stream end (include_usage=true)", request_id);
-                            println!("[{}] [DEBUG] Final usage: prompt={}, completion={}, total={}",
+                            println!(
+                                "[{}] [DEBUG] Final usage: prompt={}, completion={}, total={}",
                                 request_id,
-                                usage_accumulator.input_tokens,
-                                usage_accumulator.output_tokens,
-                                usage_accumulator.input_tokens + usage_accumulator.output_tokens
+                                state.input_tokens,
+                                state.output_tokens,
+                                state.input_tokens + state.output_tokens
                             );
                         }
                     } else {
-                        println!("[{}] [DEBUG] Usage chunk NOT emitted (include_usage=false)", request_id);
+                        println!(
+                            "[{}] [DEBUG] Usage chunk NOT emitted (include_usage=false)",
+                            request_id
+                        );
                     }
 
-                    // Final chunk
-                    openai_chunks.push("data: [DONE]\n\n".to_string());
-                },
+                    openai_chunks.push(
+                        "data: [DONE]
+
+"
+                        .to_string(),
+                    );
+                }
                 _ => {
-                    // Skip unknown events or forward as-is for debugging
+                    // Skip unknown events
                 }
             }
         }
@@ -1108,8 +1481,12 @@ async fn handle_openai_chat_impl(
     }
 
     let request_id = Uuid::new_v4().to_string()[..8].to_string();
-    state.log_info(format!("[{}] OpenAI compatible request to /v1/chat/completions", request_id));
-    state.log_info(format!("[{}] Model: {}, Stream: {}, StreamOptions: {:?}",
+    state.log_info(format!(
+        "[{}] OpenAI compatible request to /v1/chat/completions",
+        request_id
+    ));
+    state.log_info(format!(
+        "[{}] Model: {}, Stream: {}, StreamOptions: {:?}",
         request_id,
         openai_request.model,
         openai_request.stream.unwrap_or(false),
@@ -1117,22 +1494,40 @@ async fn handle_openai_chat_impl(
     ));
 
     // Log all incoming request headers
-    state.log_debug(format!("[{}] [DEBUG] Incoming request headers:", request_id));
+    state.log_debug(format!(
+        "[{}] [DEBUG] Incoming request headers:",
+        request_id
+    ));
     for (name, value) in headers.iter() {
         if let Ok(value_str) = value.to_str() {
-            state.log_debug(format!("[{}] [DEBUG]   {}: {}", request_id, name.as_str(), value_str));
+            state.log_debug(format!(
+                "[{}] [DEBUG]   {}: {}",
+                request_id,
+                name.as_str(),
+                value_str
+            ));
         } else {
-            state.log_debug(format!("[{}] [DEBUG]   {}: <non-utf8>", request_id, name.as_str()));
+            state.log_debug(format!(
+                "[{}] [DEBUG]   {}: <non-utf8>",
+                request_id,
+                name.as_str()
+            ));
         }
     }
 
     // Debug logging for request body
     match serde_json::to_string_pretty(&openai_request) {
         Ok(request_json) => {
-            state.log_debug(format!("[{}] [DEBUG] OpenAI request body:\n{}", request_id, request_json));
-        },
+            state.log_debug(format!(
+                "[{}] [DEBUG] OpenAI request body:\n{}",
+                request_id, request_json
+            ));
+        }
         Err(e) => {
-            state.log_debug(format!("[{}] [DEBUG] Failed to serialize request body: {}", request_id, e));
+            state.log_debug(format!(
+                "[{}] [DEBUG] Failed to serialize request body: {}",
+                request_id, e
+            ));
         }
     }
 
@@ -1143,9 +1538,12 @@ async fn handle_openai_chat_impl(
     let access_token = match state.get_valid_access_token(&request_id).await {
         Ok(Some(token)) => token,
         Ok(None) => {
-            state.log_warning(format!("[{}] No valid access token - authentication required", request_id));
+            state.log_warning(format!(
+                "[{}] No valid access token - authentication required",
+                request_id
+            ));
             return Err(StatusCode::UNAUTHORIZED);
-        },
+        }
         Err(e) => {
             state.log_error(format!("[{}] Token error: {}", request_id, e));
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
@@ -1159,15 +1557,22 @@ async fn handle_openai_chat_impl(
     // Debug logging for transformed Anthropic request
     match serde_json::to_string_pretty(&anthropic_request) {
         Ok(request_json) => {
-            state.log_debug(format!("[{}] [DEBUG] Transformed Anthropic request body:\n{}", request_id, request_json));
-        },
+            state.log_debug(format!(
+                "[{}] [DEBUG] Transformed Anthropic request body:\n{}",
+                request_id, request_json
+            ));
+        }
         Err(e) => {
-            state.log_debug(format!("[{}] [DEBUG] Failed to serialize Anthropic request body: {}", request_id, e));
+            state.log_debug(format!(
+                "[{}] [DEBUG] Failed to serialize Anthropic request body: {}",
+                request_id, e
+            ));
         }
     }
 
     // Make request to Anthropic API
-    let mut req_builder = state.client
+    let mut req_builder = state
+        .client
         .post(&format!("{}/v1/messages?beta=true", API_BASE))
         .header("Authorization", format!("Bearer {}", access_token))
         .header("Content-Type", "application/json")
@@ -1198,16 +1603,40 @@ async fn handle_openai_chat_impl(
     }
 
     // Log outgoing request headers to Anthropic
-    state.log_debug(format!("[{}] [DEBUG] Outgoing Anthropic request to {}/v1/messages?beta=true", request_id, API_BASE));
-    state.log_debug(format!("[{}] [DEBUG] Outgoing headers to Anthropic:", request_id));
-    state.log_debug(format!("[{}] [DEBUG]   Authorization: Bearer <redacted>", request_id));
-    state.log_debug(format!("[{}] [DEBUG]   Content-Type: application/json", request_id));
-    state.log_debug(format!("[{}] [DEBUG]   anthropic-version: {}", request_id, ANTHROPIC_VERSION));
-    state.log_debug(format!("[{}] [DEBUG]   anthropic-beta: {}", request_id, ANTHROPIC_BETA));
-    state.log_debug(format!("[{}] [DEBUG]   User-Agent: claude-cli/1.0.113 (external, cli)", request_id));
+    state.log_debug(format!(
+        "[{}] [DEBUG] Outgoing Anthropic request to {}/v1/messages?beta=true",
+        request_id, API_BASE
+    ));
+    state.log_debug(format!(
+        "[{}] [DEBUG] Outgoing headers to Anthropic:",
+        request_id
+    ));
+    state.log_debug(format!(
+        "[{}] [DEBUG]   Authorization: Bearer <redacted>",
+        request_id
+    ));
+    state.log_debug(format!(
+        "[{}] [DEBUG]   Content-Type: application/json",
+        request_id
+    ));
+    state.log_debug(format!(
+        "[{}] [DEBUG]   anthropic-version: {}",
+        request_id, ANTHROPIC_VERSION
+    ));
+    state.log_debug(format!(
+        "[{}] [DEBUG]   anthropic-beta: {}",
+        request_id, ANTHROPIC_BETA
+    ));
+    state.log_debug(format!(
+        "[{}] [DEBUG]   User-Agent: claude-cli/1.0.113 (external, cli)",
+        request_id
+    ));
     if let Some(user_agent) = headers.get("user-agent") {
         if let Ok(user_agent_str) = user_agent.to_str() {
-            state.log_debug(format!("[{}] [DEBUG]   X-Forwarded-User-Agent: {}", request_id, user_agent_str));
+            state.log_debug(format!(
+                "[{}] [DEBUG]   X-Forwarded-User-Agent: {}",
+                request_id, user_agent_str
+            ));
         }
     }
 
@@ -1220,15 +1649,30 @@ async fn handle_openai_chat_impl(
     };
 
     let status = response.status();
-    state.log_info(format!("[{}] Anthropic API response: {}", request_id, status));
+    state.log_info(format!(
+        "[{}] Anthropic API response: {}",
+        request_id, status
+    ));
 
     // Log all incoming response headers from Anthropic
-    state.log_debug(format!("[{}] [DEBUG] Anthropic response headers:", request_id));
+    state.log_debug(format!(
+        "[{}] [DEBUG] Anthropic response headers:",
+        request_id
+    ));
     for (name, value) in response.headers().iter() {
         if let Ok(value_str) = value.to_str() {
-            state.log_debug(format!("[{}] [DEBUG]   {}: {}", request_id, name.as_str(), value_str));
+            state.log_debug(format!(
+                "[{}] [DEBUG]   {}: {}",
+                request_id,
+                name.as_str(),
+                value_str
+            ));
         } else {
-            state.log_debug(format!("[{}] [DEBUG]   {}: <non-utf8>", request_id, name.as_str()));
+            state.log_debug(format!(
+                "[{}] [DEBUG]   {}: <non-utf8>",
+                request_id,
+                name.as_str()
+            ));
         }
     }
 
@@ -1236,10 +1680,11 @@ async fn handle_openai_chat_impl(
     let mut response_headers = Vec::new();
     for (name, value) in response.headers().iter() {
         let header_name = name.as_str();
-        if header_name.starts_with("x-anthropic-ratelimit-") ||
-           header_name.starts_with("anthropic-ratelimit-") ||
-           header_name == "x-request-id" ||
-           header_name == "anthropic-request-id" {
+        if header_name.starts_with("x-anthropic-ratelimit-")
+            || header_name.starts_with("anthropic-ratelimit-")
+            || header_name == "x-request-id"
+            || header_name == "anthropic-request-id"
+        {
             if let Ok(value_str) = value.to_str() {
                 response_headers.push((header_name.to_string(), value_str.to_string()));
             }
@@ -1249,17 +1694,26 @@ async fn handle_openai_chat_impl(
     if !status.is_success() {
         // Handle error response - transform to OpenAI format
         let error_text = response.text().await.unwrap_or_default();
-        state.log_error(format!("[{}] Anthropic API error ({}): {}", request_id, status, &error_text));
+        state.log_error(format!(
+            "[{}] Anthropic API error ({}): {}",
+            request_id, status, &error_text
+        ));
 
         // Debug logging for raw Anthropic error response
-        state.log_debug(format!("[{}] [DEBUG] Raw Anthropic error response:\n{}", request_id, error_text));
+        state.log_debug(format!(
+            "[{}] [DEBUG] Raw Anthropic error response:\n{}",
+            request_id, error_text
+        ));
 
         // Try to parse and transform the error to OpenAI format
         let openai_error = match serde_json::from_str::<Value>(&error_text) {
             Ok(anthropic_error) => {
                 // Check if it's an Anthropic error format
                 if anthropic_error.get("type").and_then(|t| t.as_str()) == Some("error") {
-                    state.log_debug(format!("[{}] [DEBUG] Transforming Anthropic error to OpenAI format", request_id));
+                    state.log_debug(format!(
+                        "[{}] [DEBUG] Transforming Anthropic error to OpenAI format",
+                        request_id
+                    ));
                     transform_anthropic_error_to_openai(&anthropic_error)
                 } else {
                     // Not standard Anthropic error format, create generic OpenAI error
@@ -1272,7 +1726,7 @@ async fn handle_openai_chat_impl(
                         }
                     })
                 }
-            },
+            }
             Err(_) => {
                 // If we can't parse the error, create a generic OpenAI error
                 json!({
@@ -1289,10 +1743,16 @@ async fn handle_openai_chat_impl(
         // Debug logging for transformed OpenAI error
         match serde_json::to_string_pretty(&openai_error) {
             Ok(error_json) => {
-                state.log_debug(format!("[{}] [DEBUG] Transformed OpenAI error:\n{}", request_id, error_json));
-            },
+                state.log_debug(format!(
+                    "[{}] [DEBUG] Transformed OpenAI error:\n{}",
+                    request_id, error_json
+                ));
+            }
             Err(e) => {
-                state.log_debug(format!("[{}] [DEBUG] Failed to serialize OpenAI error: {}", request_id, e));
+                state.log_debug(format!(
+                    "[{}] [DEBUG] Failed to serialize OpenAI error: {}",
+                    request_id, e
+                ));
             }
         }
 
@@ -1306,22 +1766,40 @@ async fn handle_openai_chat_impl(
         }
 
         // Log outgoing error response headers to client
-        state.log_debug(format!("[{}] [DEBUG] Outgoing error response headers to client:", request_id));
-        state.log_debug(format!("[{}] [DEBUG]   Status: {}", request_id, status.as_u16()));
-        state.log_debug(format!("[{}] [DEBUG]   Content-Type: application/json", request_id));
+        state.log_debug(format!(
+            "[{}] [DEBUG] Outgoing error response headers to client:",
+            request_id
+        ));
+        state.log_debug(format!(
+            "[{}] [DEBUG]   Status: {}",
+            request_id,
+            status.as_u16()
+        ));
+        state.log_debug(format!(
+            "[{}] [DEBUG]   Content-Type: application/json",
+            request_id
+        ));
         for (name, value) in &response_headers {
             state.log_debug(format!("[{}] [DEBUG]   {}: {}", request_id, name, value));
         }
 
         return Ok(response_builder
-            .body(Body::from(serde_json::to_string(&openai_error).unwrap_or_else(|_| error_text)))
+            .body(Body::from(
+                serde_json::to_string(&openai_error).unwrap_or_else(|_| error_text),
+            ))
             .unwrap());
     }
 
     if openai_request.stream.unwrap_or(false) {
         // Transform streaming response from Anthropic to OpenAI format
-        state.log_info(format!("[{}] Streaming response with OpenAI transformation", request_id));
-        state.log_debug(format!("[{}] [DEBUG] Starting stream transformation", request_id));
+        state.log_info(format!(
+            "[{}] Streaming response with OpenAI transformation",
+            request_id
+        ));
+        state.log_debug(format!(
+            "[{}] [DEBUG] Starting stream transformation",
+            request_id
+        ));
 
         let created = chrono::Utc::now().timestamp() as u64;
         let original_model = openai_request.model.clone();
@@ -1329,16 +1807,20 @@ async fn handle_openai_chat_impl(
         let state_clone = state.clone();
 
         // Check if client requested usage statistics in streaming response
-        let include_usage = openai_request.stream_options
+        let include_usage = openai_request
+            .stream_options
             .as_ref()
             .and_then(|opts| opts.include_usage)
             .unwrap_or(false);
 
-        state.log_debug(format!("[{}] [DEBUG] stream_options.include_usage = {}", request_id, include_usage));
+        state.log_debug(format!(
+            "[{}] [DEBUG] stream_options.include_usage = {}",
+            request_id, include_usage
+        ));
 
         // Create a stream that transforms Anthropic chunks to OpenAI format with stateful usage tracking
-        let usage_accumulator = Arc::new(parking_lot::Mutex::new(StreamingUsageAccumulator::default()));
-        let usage_accumulator_clone = usage_accumulator.clone();
+        let transform_state = Arc::new(parking_lot::Mutex::new(StreamingTransformState::default()));
+        let transform_state_clone = transform_state.clone();
 
         let stream = response.bytes_stream().map(move |chunk_result| {
             match chunk_result {
@@ -1354,18 +1836,18 @@ async fn handle_openai_chat_impl(
                     };
                     state_clone.log_debug(format!("[{}] [DEBUG] Raw chunk content: {}", request_id_clone, preview));
 
-                    let mut accumulator = usage_accumulator_clone.lock();
+                    let mut state_guard = transform_state_clone.lock();
 
-                    // Log accumulator state before processing
-                    state_clone.log_debug(format!("[{}] [DEBUG] Accumulator state before: input_tokens={}, output_tokens={}, has_input={}, has_final_output={}",
+                    // Log streaming state before processing
+                    state_clone.log_debug(format!("[{}] [DEBUG] Streaming state before: input_tokens={}, output_tokens={}, has_input={}, has_final_output={}",
                         request_id_clone,
-                        accumulator.input_tokens,
-                        accumulator.output_tokens,
-                        accumulator.has_input_tokens,
-                        accumulator.has_final_output_tokens
+                        state_guard.input_tokens,
+                        state_guard.output_tokens,
+                        state_guard.has_input_tokens,
+                        state_guard.has_final_output_tokens
                     ));
 
-                    match transform_anthropic_streaming_chunk(&chunk, &request_id_clone, &original_model, created, &mut *accumulator, include_usage) {
+                    match transform_anthropic_streaming_chunk(&chunk, &request_id_clone, &original_model, created, &mut *state_guard, include_usage) {
                         Ok(openai_chunks) => {
                             state_clone.log_debug(format!("[{}] [DEBUG] Transformed to {} OpenAI chunks", request_id_clone, openai_chunks.len()));
 
@@ -1379,13 +1861,13 @@ async fn handle_openai_chat_impl(
                                 state_clone.log_debug(format!("[{}] [DEBUG] OpenAI chunk {}: {}", request_id_clone, i, preview));
                             }
 
-                            // Log accumulator state after processing
-                            state_clone.log_debug(format!("[{}] [DEBUG] Accumulator state after: input_tokens={}, output_tokens={}, has_input={}, has_final_output={}",
+                            // Log streaming state after processing
+                            state_clone.log_debug(format!("[{}] [DEBUG] Streaming state after: input_tokens={}, output_tokens={}, has_input={}, has_final_output={}",
                                 request_id_clone,
-                                accumulator.input_tokens,
-                                accumulator.output_tokens,
-                                accumulator.has_input_tokens,
-                                accumulator.has_final_output_tokens
+                                state_guard.input_tokens,
+                                state_guard.output_tokens,
+                                state_guard.has_input_tokens,
+                                state_guard.has_final_output_tokens
                             ));
 
                             let combined = openai_chunks.join("");
@@ -1419,30 +1901,47 @@ async fn handle_openai_chat_impl(
         }
 
         // Log outgoing streaming response headers to client
-        state.log_debug(format!("[{}] [DEBUG] Outgoing streaming response headers to client:", request_id));
+        state.log_debug(format!(
+            "[{}] [DEBUG] Outgoing streaming response headers to client:",
+            request_id
+        ));
         state.log_debug(format!("[{}] [DEBUG]   Status: 200", request_id));
-        state.log_debug(format!("[{}] [DEBUG]   Content-Type: text/event-stream", request_id));
-        state.log_debug(format!("[{}] [DEBUG]   Cache-Control: no-cache", request_id));
+        state.log_debug(format!(
+            "[{}] [DEBUG]   Content-Type: text/event-stream",
+            request_id
+        ));
+        state.log_debug(format!(
+            "[{}] [DEBUG]   Cache-Control: no-cache",
+            request_id
+        ));
         state.log_debug(format!("[{}] [DEBUG]   Connection: keep-alive", request_id));
         for (name, value) in &response_headers {
             state.log_debug(format!("[{}] [DEBUG]   {}: {}", request_id, name, value));
         }
 
-        Ok(response_builder
-            .body(body)
-            .unwrap())
+        Ok(response_builder.body(body).unwrap())
     } else {
         // Transform non-streaming response to OpenAI format
         let response_text = response.text().await.unwrap_or_default();
 
         // Debug logging for raw Anthropic response
-        state.log_debug(format!("[{}] [DEBUG] Raw Anthropic response:\n{}", request_id, response_text));
+        state.log_debug(format!(
+            "[{}] [DEBUG] Raw Anthropic response:\n{}",
+            request_id, response_text
+        ));
 
         match serde_json::from_str::<Value>(&response_text) {
             Ok(anthropic_response) => {
-                match transform_anthropic_to_openai(&anthropic_response, &openai_request.model, &request_id) {
+                match transform_anthropic_to_openai(
+                    &anthropic_response,
+                    &openai_request.model,
+                    &request_id,
+                ) {
                     Ok(openai_response) => {
-                        state.log_info(format!("[{}] Successfully transformed to OpenAI format", request_id));
+                        state.log_info(format!(
+                            "[{}] Successfully transformed to OpenAI format",
+                            request_id
+                        ));
 
                         // Debug log the transformed usage
                         println!("[{}] [DEBUG] Transformed OpenAI response usage: prompt={}, completion={}, total={}",
@@ -1455,10 +1954,16 @@ async fn handle_openai_chat_impl(
                         // Debug logging for transformed OpenAI response
                         match serde_json::to_string_pretty(&openai_response) {
                             Ok(response_json) => {
-                                state.log_debug(format!("[{}] [DEBUG] Transformed OpenAI response:\n{}", request_id, response_json));
-                            },
+                                state.log_debug(format!(
+                                    "[{}] [DEBUG] Transformed OpenAI response:\n{}",
+                                    request_id, response_json
+                                ));
+                            }
                             Err(e) => {
-                                state.log_debug(format!("[{}] [DEBUG] Failed to serialize OpenAI response: {}", request_id, e));
+                                state.log_debug(format!(
+                                    "[{}] [DEBUG] Failed to serialize OpenAI response: {}",
+                                    request_id, e
+                                ));
                             }
                         }
 
@@ -1472,23 +1977,32 @@ async fn handle_openai_chat_impl(
                         }
 
                         // Log outgoing non-streaming response headers to client
-                        state.log_debug(format!("[{}] [DEBUG] Outgoing non-streaming response headers to client:", request_id));
+                        state.log_debug(format!(
+                            "[{}] [DEBUG] Outgoing non-streaming response headers to client:",
+                            request_id
+                        ));
                         state.log_debug(format!("[{}] [DEBUG]   Status: 200", request_id));
-                        state.log_debug(format!("[{}] [DEBUG]   Content-Type: application/json", request_id));
+                        state.log_debug(format!(
+                            "[{}] [DEBUG]   Content-Type: application/json",
+                            request_id
+                        ));
                         for (name, value) in &response_headers {
-                            state.log_debug(format!("[{}] [DEBUG]   {}: {}", request_id, name, value));
+                            state.log_debug(format!(
+                                "[{}] [DEBUG]   {}: {}",
+                                request_id, name, value
+                            ));
                         }
 
                         Ok(response_builder
                             .body(Body::from(serde_json::to_string(&openai_response).unwrap()))
                             .unwrap())
-                    },
+                    }
                     Err(e) => {
                         state.log_error(format!("[{}] Transform error: {}", request_id, e));
                         Err(StatusCode::INTERNAL_SERVER_ERROR)
                     }
                 }
-            },
+            }
             Err(e) => {
                 state.log_error(format!("[{}] Parse error: {}", request_id, e));
                 Err(StatusCode::INTERNAL_SERVER_ERROR)
@@ -1509,7 +2023,7 @@ async fn handle_fallback(uri: Uri, method: Method) -> impl IntoResponse {
                 "type": "not_found",
                 "message": format!("Unknown endpoint: {} {}", method, uri.path())
             }
-        }))
+        })),
     )
 }
 
@@ -1537,11 +2051,12 @@ fn get_thinking_budget_tokens(model: &str) -> Option<u32> {
 
 // Check if a model supports thinking
 fn supports_thinking(anthropic_model: &str) -> bool {
-    matches!(anthropic_model,
-        "claude-opus-4-1-20250805" |
-        "claude-opus-4-20250514" |
-        "claude-sonnet-4-20250514" |
-        "claude-3-7-sonnet-20250219"
+    matches!(
+        anthropic_model,
+        "claude-opus-4-1-20250805"
+            | "claude-opus-4-20250514"
+            | "claude-sonnet-4-20250514"
+            | "claude-3-7-sonnet-20250219"
     )
 }
 
@@ -1566,7 +2081,9 @@ fn transform_openai_tools_to_anthropic(openai_request: &OpenAIRequest) -> Option
     if let Some(tools) = &openai_request.tools {
         for tool in tools {
             if tool.tool_type == "function" {
-                anthropic_tools.push(transform_openai_function_to_anthropic_tool(&tool.function));
+                if let Some(function) = &tool.function {
+                    anthropic_tools.push(transform_openai_function_to_anthropic_tool(function));
+                }
             }
         }
     }
@@ -1594,22 +2111,92 @@ fn transform_openai_to_anthropic(openai_request: &OpenAIRequest) -> AnthropicMes
     for message in &openai_request.messages {
         match message.role.as_str() {
             "system" => {
-                // For system messages, we need to extract content parts into system array
                 let anthropic_content = message.get_anthropic_content();
                 if let Value::Array(content_parts) = anthropic_content {
                     system_messages.extend(content_parts);
                 }
-            },
-            "user" | "assistant" => {
-                // For regular messages, preserve the full content structure
+            }
+            "user" => {
                 let anthropic_content = message.get_anthropic_content();
                 anthropic_messages.push(json!({
-                    "role": message.role,
+                    "role": "user",
                     "content": anthropic_content
                 }));
-            },
+            }
+            "assistant" => {
+                let mut content_parts = Vec::new();
+                match message.get_anthropic_content() {
+                    Value::Array(parts) => {
+                        content_parts.extend(parts);
+                    }
+                    Value::Object(obj) => {
+                        content_parts.push(Value::Object(obj));
+                    }
+                    Value::Null => {}
+                    other => {
+                        content_parts.push(other);
+                    }
+                }
+
+                if let Some(tool_calls) = &message.tool_calls {
+                    for call in tool_calls {
+                        if call.call_type == "function" {
+                            if let Some(function) = &call.function {
+                                let input_value = parse_function_arguments(&function.arguments);
+                                let tool_use = json!({
+                                    "type": "tool_use",
+                                    "id": call.id,
+                                    "name": function.name,
+                                    "input": input_value
+                                });
+                                content_parts.push(tool_use);
+                            }
+                        }
+                    }
+                } else if let Some(function_call) = &message.function_call {
+                    let generated_id = format!("function_call_{}", Uuid::new_v4().simple());
+                    let input_value = parse_function_arguments(&function_call.arguments);
+                    let tool_use = json!({
+                        "type": "tool_use",
+                        "id": generated_id,
+                        "name": function_call.name,
+                        "input": input_value
+                    });
+                    content_parts.push(tool_use);
+                }
+
+                anthropic_messages.push(json!({
+                    "role": "assistant",
+                    "content": Value::Array(content_parts)
+                }));
+            }
+            "tool" => {
+                if let Some(tool_call_id) = &message.tool_call_id {
+                    let tool_result_content = message.get_anthropic_content();
+                    let mut tool_result = json!({
+                        "type": "tool_result",
+                        "tool_use_id": tool_call_id,
+                        "content": tool_result_content
+                    });
+                    if let Some(name) = &message.name {
+                        if let Value::Object(obj) = &mut tool_result {
+                            obj.insert("name".to_string(), Value::String(name.clone()));
+                        }
+                    }
+                    anthropic_messages.push(json!({
+                        "role": "user",
+                        "content": [tool_result]
+                    }));
+                } else {
+                    let anthropic_content = message.get_anthropic_content();
+                    anthropic_messages.push(json!({
+                        "role": "user",
+                        "content": anthropic_content
+                    }));
+                }
+            }
             _ => {
-                // Skip unknown roles
+                // Skip unsupported roles quietly
             }
         }
     }
@@ -1637,6 +2224,10 @@ fn transform_openai_to_anthropic(openai_request: &OpenAIRequest) -> AnthropicMes
 
     // Transform tools
     let anthropic_tools = transform_openai_tools_to_anthropic(openai_request);
+    let anthropic_tool_choice = openai_request
+        .tool_choice
+        .as_ref()
+        .and_then(map_openai_tool_choice);
 
     AnthropicMessageRequest {
         model: base_model,
@@ -1649,44 +2240,98 @@ fn transform_openai_to_anthropic(openai_request: &OpenAIRequest) -> AnthropicMes
         },
         top_p: openai_request.top_p,
         top_k: None, // OpenAI doesn't have top_k
-        system: if system_messages.is_empty() { None } else { Some(system_messages) },
+        system: if system_messages.is_empty() {
+            None
+        } else {
+            Some(system_messages)
+        },
         stream: openai_request.stream,
         thinking,
         tools: anthropic_tools,
+        tool_choice: anthropic_tool_choice,
     }
 }
 
 // Transform Anthropic response to OpenAI format
-fn transform_anthropic_to_openai(anthropic_response: &Value, original_model: &str, request_id: &str) -> Result<OpenAIResponse, anyhow::Error> {
+fn transform_anthropic_to_openai(
+    anthropic_response: &Value,
+    original_model: &str,
+    request_id: &str,
+) -> Result<OpenAIResponse, anyhow::Error> {
     let id = format!("chatcmpl-{}", request_id);
     let created = chrono::Utc::now().timestamp() as u64;
 
-    // Extract content from Anthropic response with improved robustness
-    let content = if let Some(content_array) = anthropic_response.get("content").and_then(|c| c.as_array()) {
-        if content_array.is_empty() {
-            "".to_string()
-        } else {
-            // Combine all text content parts
-            let mut text_parts = Vec::new();
-            for item in content_array {
-                if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
-                    text_parts.push(text);
-                } else if let Some(text) = item.as_str() {
-                    // Handle case where content item is just a string
-                    text_parts.push(text);
+    let mut aggregated_text = String::new();
+    let mut content_parts: Vec<Value> = Vec::new();
+    let mut tool_calls: Vec<OpenAIToolCall> = Vec::new();
+    let mut has_structured_content = false;
+
+    if let Some(content_array) = anthropic_response.get("content").and_then(|c| c.as_array()) {
+        for item in content_array {
+            match item.get("type").and_then(|t| t.as_str()) {
+                Some("text") => {
+                    if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                        aggregated_text.push_str(text);
+                        content_parts.push(json!({"type": "text", "text": text}));
+                    }
+                }
+                Some("tool_use") => {
+                    has_structured_content = true;
+                    let tool_id = item
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| format!("tool_call_{}", Uuid::new_v4().simple()));
+                    let tool_name = item
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .unwrap_or_default();
+                    let input_value = item
+                        .get("input")
+                        .cloned()
+                        .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+                    let arguments =
+                        serde_json::to_string(&input_value).unwrap_or_else(|_| "{}".to_string());
+                    let tool_call = OpenAIToolCall {
+                        id: tool_id,
+                        call_type: "function".to_string(),
+                        function: Some(OpenAIToolCallFunction {
+                            name: tool_name,
+                            arguments,
+                        }),
+                        extra: HashMap::new(),
+                    };
+                    tool_calls.push(tool_call);
+                }
+                _ => {
+                    let fallback = if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                        text.to_string()
+                    } else {
+                        serde_json::to_string(item).unwrap_or_default()
+                    };
+                    if !fallback.is_empty() {
+                        has_structured_content = true;
+                        aggregated_text.push_str(&fallback);
+                        content_parts.push(json!({"type": "text", "text": fallback}));
+                    }
                 }
             }
-            text_parts.join("")
         }
     } else if let Some(content_str) = anthropic_response.get("content").and_then(|c| c.as_str()) {
-        // Handle case where content is a single string
-        content_str.to_string()
+        aggregated_text.push_str(content_str);
+    }
+
+    let content_value = if !tool_calls.is_empty() || has_structured_content {
+        if content_parts.is_empty() {
+            Value::String(aggregated_text.clone())
+        } else {
+            Value::Array(content_parts.clone())
+        }
     } else {
-        // Fallback to empty content
-        "".to_string()
+        Value::String(aggregated_text.clone())
     };
 
-    // Extract usage information with better error handling
     let usage_info = anthropic_response.get("usage");
     let prompt_tokens = usage_info
         .and_then(|u| u.get("input_tokens"))
@@ -1697,11 +2342,14 @@ fn transform_anthropic_to_openai(anthropic_response: &Value, original_model: &st
         .and_then(|t| t.as_u64())
         .unwrap_or(0) as u32;
 
-    // Debug log usage information
-    println!("[{}] [DEBUG] Non-streaming response usage: prompt={}, completion={}, total={}",
-        request_id, prompt_tokens, completion_tokens, prompt_tokens + completion_tokens);
+    println!(
+        "[{}] [DEBUG] Non-streaming response usage: prompt={}, completion={}, total={}",
+        request_id,
+        prompt_tokens,
+        completion_tokens,
+        prompt_tokens + completion_tokens
+    );
 
-    // Determine finish reason with more comprehensive mapping
     let stop_reason = anthropic_response
         .get("stop_reason")
         .and_then(|r| r.as_str())
@@ -1713,13 +2361,20 @@ fn transform_anthropic_to_openai(anthropic_response: &Value, original_model: &st
         "stop_sequence" => "stop",
         "tool_use" => "tool_calls",
         _ => "stop",
-    }.to_string();
+    }
+    .to_string();
 
-    // Create OpenAI message with proper content handling
     let openai_message = OpenAIMessage {
         role: "assistant".to_string(),
-        content: serde_json::Value::String(content),
+        content: content_value,
         name: None,
+        tool_calls: if tool_calls.is_empty() {
+            None
+        } else {
+            Some(tool_calls)
+        },
+        tool_call_id: None,
+        function_call: None,
     };
 
     Ok(OpenAIResponse {
@@ -1730,7 +2385,7 @@ fn transform_anthropic_to_openai(anthropic_response: &Value, original_model: &st
         choices: vec![OpenAIChoice {
             index: 0,
             message: openai_message,
-            finish_reason,
+            finish_reason: Some(finish_reason),
         }],
         usage: OpenAIUsage {
             prompt_tokens,
@@ -1746,11 +2401,13 @@ fn transform_anthropic_error_to_openai(anthropic_error: &Value) -> Value {
     // OpenAI error format: {"error":{"message":"...","type":"...","param":null,"code":null}}
 
     if let Some(error_obj) = anthropic_error.get("error") {
-        let message = error_obj.get("message")
+        let message = error_obj
+            .get("message")
             .and_then(|m| m.as_str())
             .unwrap_or("Unknown error");
 
-        let error_type = error_obj.get("type")
+        let error_type = error_obj
+            .get("type")
             .and_then(|t| t.as_str())
             .unwrap_or("unknown_error");
 
@@ -1773,6 +2430,55 @@ fn transform_anthropic_error_to_openai(anthropic_error: &Value) -> Value {
                 "code": null
             }
         })
+    }
+}
+
+fn parse_function_arguments(arguments: &str) -> Value {
+    if arguments.trim().is_empty() {
+        return Value::Object(serde_json::Map::new());
+    }
+
+    match serde_json::from_str::<Value>(arguments) {
+        Ok(Value::Object(map)) => Value::Object(map),
+        Ok(Value::Array(array)) => Value::Array(array),
+        Ok(Value::Null) => Value::Object(serde_json::Map::new()),
+        Ok(other) => {
+            let mut wrapper = serde_json::Map::new();
+            wrapper.insert("value".to_string(), other);
+            Value::Object(wrapper)
+        }
+        Err(_) => {
+            let mut wrapper = serde_json::Map::new();
+            wrapper.insert("value".to_string(), Value::String(arguments.to_string()));
+            Value::Object(wrapper)
+        }
+    }
+}
+
+fn map_openai_tool_choice(choice: &Value) -> Option<Value> {
+    match choice {
+        Value::Object(obj) => {
+            if let Some(Value::String(choice_type)) = obj.get("type") {
+                match choice_type.as_str() {
+                    "function" => {
+                        if let Some(Value::Object(function_obj)) = obj.get("function") {
+                            if let Some(Value::String(name)) = function_obj.get("name") {
+                                return Some(json!({
+                                    "type": "tool",
+                                    "name": name
+                                }));
+                            }
+                        }
+                        None
+                    }
+                    "tool" => Some(Value::Object(obj.clone())),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        }
+        _ => None,
     }
 }
 

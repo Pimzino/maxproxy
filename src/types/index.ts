@@ -42,3 +42,10 @@ export interface AppState {
   logs: LogEntry[];
   initStatus: InitStatus | null;
 }
+
+export interface SystemInfo {
+  os: string;
+  version: string;
+  edition?: string | null;
+  arch: string;
+}

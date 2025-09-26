@@ -6,6 +6,7 @@ import { AppProvider, useAppContext } from "./contexts/AppContext";
 import AuthPage from "./pages/AuthPage";
 import ProxyPage from "./pages/ProxyPage";
 import SettingsPage from "./pages/SettingsPage";
+import AboutPage from "./pages/AboutPage";
 import LogsPage from "./pages/LogsPage";
 import "./App.css";
 
@@ -114,6 +115,7 @@ function AppContent() {
           <Route path="/auth" element={<AuthPage />} />
           <Route path="/proxy" element={<ProxyPage />} />
           <Route path="/settings" element={<SettingsPage />} />
+          <Route path="/about" element={<AboutPage />} />
           <Route path="/logs" element={<LogsPage />} />
         </Routes>
       </Layout>

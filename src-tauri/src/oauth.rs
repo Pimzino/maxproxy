@@ -47,9 +47,8 @@ impl OAuthManager {
     /// Generate PKCE code verifier and challenge (plan.md section 3.1)
     pub fn generate_pkce(&mut self) -> Result<PKCEParams> {
         // Generate high-entropy code_verifier (43-128 chars)
-        let code_verifier = general_purpose::URL_SAFE_NO_PAD.encode(
-            &rand::thread_rng().gen::<[u8; 32]>()
-        );
+        let code_verifier =
+            general_purpose::URL_SAFE_NO_PAD.encode(&rand::thread_rng().gen::<[u8; 32]>());
 
         // Create code_challenge using SHA-256
         let mut hasher = Sha256::new();
@@ -111,7 +110,9 @@ impl OAuthManager {
 
     /// Exchange authorization code for tokens (plan.md section 3.4)
     pub async fn exchange_code(&self, code: &str) -> Result<TokenResponse> {
-        let pkce_params = self.pkce_params.as_ref()
+        let pkce_params = self
+            .pkce_params
+            .as_ref()
             .ok_or_else(|| anyhow!("No PKCE parameters available. Call start_login_flow first."))?;
 
         // Split the code and state (they come as "code#state")
@@ -121,17 +122,39 @@ impl OAuthManager {
 
         // Verify state
         if received_state != &pkce_params.state {
-            return Err(anyhow!("State mismatch: expected {}, got {}", pkce_params.state, received_state));
+            return Err(anyhow!(
+                "State mismatch: expected {}, got {}",
+                pkce_params.state,
+                received_state
+            ));
         }
 
         // Prepare token exchange request - match Python implementation exactly
         let mut params = serde_json::Map::new();
-        params.insert("code".to_string(), serde_json::Value::String(actual_code.to_string()));
-        params.insert("state".to_string(), serde_json::Value::String(received_state.to_string()));
-        params.insert("grant_type".to_string(), serde_json::Value::String("authorization_code".to_string()));
-        params.insert("client_id".to_string(), serde_json::Value::String(CLIENT_ID.to_string()));
-        params.insert("redirect_uri".to_string(), serde_json::Value::String(REDIRECT_URI.to_string()));
-        params.insert("code_verifier".to_string(), serde_json::Value::String(pkce_params.code_verifier.clone()));
+        params.insert(
+            "code".to_string(),
+            serde_json::Value::String(actual_code.to_string()),
+        );
+        params.insert(
+            "state".to_string(),
+            serde_json::Value::String(received_state.to_string()),
+        );
+        params.insert(
+            "grant_type".to_string(),
+            serde_json::Value::String("authorization_code".to_string()),
+        );
+        params.insert(
+            "client_id".to_string(),
+            serde_json::Value::String(CLIENT_ID.to_string()),
+        );
+        params.insert(
+            "redirect_uri".to_string(),
+            serde_json::Value::String(REDIRECT_URI.to_string()),
+        );
+        params.insert(
+            "code_verifier".to_string(),
+            serde_json::Value::String(pkce_params.code_verifier.clone()),
+        );
 
         let response = self
             .client
@@ -145,7 +168,11 @@ impl OAuthManager {
         if !response.status().is_success() {
             let status = response.status();
             let error_text = response.text().await.unwrap_or_default();
-            return Err(anyhow!("Token exchange failed with status {}: {}", status, error_text));
+            return Err(anyhow!(
+                "Token exchange failed with status {}: {}",
+                status,
+                error_text
+            ));
         }
 
         let token_response: TokenResponse = response.json().await?;
@@ -155,9 +182,18 @@ impl OAuthManager {
     /// Refresh access token using refresh token
     pub async fn refresh_token(&self, refresh_token: &str) -> Result<TokenResponse> {
         let mut params = serde_json::Map::new();
-        params.insert("grant_type".to_string(), serde_json::Value::String("refresh_token".to_string()));
-        params.insert("client_id".to_string(), serde_json::Value::String(CLIENT_ID.to_string()));
-        params.insert("refresh_token".to_string(), serde_json::Value::String(refresh_token.to_string()));
+        params.insert(
+            "grant_type".to_string(),
+            serde_json::Value::String("refresh_token".to_string()),
+        );
+        params.insert(
+            "client_id".to_string(),
+            serde_json::Value::String(CLIENT_ID.to_string()),
+        );
+        params.insert(
+            "refresh_token".to_string(),
+            serde_json::Value::String(refresh_token.to_string()),
+        );
 
         let response = self
             .client
@@ -171,7 +207,11 @@ impl OAuthManager {
         if !response.status().is_success() {
             let status = response.status();
             let error_text = response.text().await.unwrap_or_default();
-            return Err(anyhow!("Token refresh failed with status {}: {}", status, error_text));
+            return Err(anyhow!(
+                "Token refresh failed with status {}: {}",
+                status,
+                error_text
+            ));
         }
 
         let token_response: TokenResponse = response.json().await?;
@@ -179,11 +219,18 @@ impl OAuthManager {
     }
 
     /// Refresh access token with retry mechanism and exponential backoff
-    pub async fn refresh_token_with_retry(&self, refresh_token: &str, max_retries: usize) -> Result<TokenResponse> {
+    pub async fn refresh_token_with_retry(
+        &self,
+        refresh_token: &str,
+        max_retries: usize,
+    ) -> Result<TokenResponse> {
         let mut last_error = None;
 
         for attempt in 1..=max_retries {
-            println!("[OAuth] Attempting token refresh (attempt {}/{})", attempt, max_retries);
+            println!(
+                "[OAuth] Attempting token refresh (attempt {}/{})",
+                attempt, max_retries
+            );
 
             match self.refresh_token(refresh_token).await {
                 Ok(token_response) => {
@@ -192,7 +239,10 @@ impl OAuthManager {
                 }
                 Err(e) => {
                     let error_msg = e.to_string();
-                    println!("[OAuth] ✗ Token refresh failed on attempt {}: {}", attempt, error_msg);
+                    println!(
+                        "[OAuth] ✗ Token refresh failed on attempt {}: {}",
+                        attempt, error_msg
+                    );
                     last_error = Some(e);
 
                     // If this isn't the last attempt, wait before retrying
@@ -205,8 +255,12 @@ impl OAuthManager {
             }
         }
 
-        let final_error = last_error.unwrap_or_else(|| anyhow!("Token refresh failed after {} attempts", max_retries));
-        println!("[OAuth] ✗ All token refresh attempts failed. Final error: {}", final_error);
+        let final_error = last_error
+            .unwrap_or_else(|| anyhow!("Token refresh failed after {} attempts", max_retries));
+        println!(
+            "[OAuth] ✗ All token refresh attempts failed. Final error: {}",
+            final_error
+        );
         Err(final_error)
     }
 }

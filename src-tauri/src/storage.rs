@@ -3,6 +3,7 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::RwLock;
 
 use crate::oauth::TokenResponse;
 use crate::proxy::ProxyConfig;
@@ -28,12 +29,14 @@ pub struct TokenStatus {
 #[derive(Debug)]
 pub struct TokenStorage {
     app_dir: PathBuf,
+    // Cache to avoid repeated disk reads
+    cache: RwLock<Option<StoredToken>>,
 }
 
 impl TokenStorage {
     pub fn new() -> Result<Self> {
-        let home_dir = dirs::home_dir()
-            .ok_or_else(|| anyhow!("Could not determine home directory"))?;
+        let home_dir =
+            dirs::home_dir().ok_or_else(|| anyhow!("Could not determine home directory"))?;
 
         let app_dir = home_dir.join(APP_DIR);
 
@@ -45,13 +48,16 @@ impl TokenStorage {
 
         println!("[TokenStorage] Using storage directory: {:?}", app_dir);
 
-        Ok(Self { app_dir })
+        Ok(Self { app_dir, cache: RwLock::new(None) })
     }
 
     /// Save tokens to file
     pub fn save_tokens(&self, token_response: &TokenResponse) -> Result<()> {
         println!("[TokenStorage] Attempting to save tokens...");
-        println!("[TokenStorage] Token expires in: {} seconds", token_response.expires_in);
+        println!(
+            "[TokenStorage] Token expires in: {} seconds",
+            token_response.expires_in
+        );
 
         let expires_at = Utc::now() + Duration::seconds(token_response.expires_in as i64);
         println!("[TokenStorage] Token will expire at: {}", expires_at);
@@ -70,49 +76,73 @@ impl TokenStorage {
 
         match fs::write(&token_file, &token_json) {
             Ok(_) => {
-                println!("[TokenStorage] ✓ Successfully saved tokens to file");
+                println!("[TokenStorage] V Successfully saved tokens to file");
+                // Update cache with latest tokens
+                if let Ok(mut guard) = self.cache.write() {
+                    *guard = Some(stored_token);
+                }
                 Ok(())
             }
             Err(e) => {
-                println!("[TokenStorage] ✗ Failed to save tokens to file: {}", e);
+                println!("[TokenStorage] ? Failed to save tokens to file: {}", e);
                 Err(anyhow!("Failed to save tokens to file: {}", e))
             }
         }
     }
 
-    /// Load tokens from file
+    /// Load tokens from file (uses in-memory cache when available)
     pub fn load_tokens(&self) -> Result<Option<StoredToken>> {
+        // Serve from cache if present
+        if let Ok(guard) = self.cache.read() {
+            if let Some(tok) = guard.as_ref() {
+                return Ok(Some(tok.clone()));
+            }
+        }
+
         let token_file = self.get_token_file_path();
 
-        println!("[TokenStorage] Attempting to load tokens from: {:?}", token_file);
+        println!(
+            "[TokenStorage] Attempting to load tokens from: {:?}",
+            token_file
+        );
 
         if !token_file.exists() {
-            println!("[TokenStorage] ℹ No token file found");
+            println!("[TokenStorage] ? No token file found");
             return Ok(None);
         }
 
         match fs::read_to_string(&token_file) {
             Ok(token_json) => {
-                println!("[TokenStorage] ✓ Successfully read token file (length: {} chars)", token_json.len());
+                println!(
+                    "[TokenStorage] V Successfully read token file (length: {} chars)",
+                    token_json.len()
+                );
 
                 match serde_json::from_str::<StoredToken>(&token_json) {
                     Ok(stored_token) => {
                         let now = Utc::now();
                         let is_expired = now >= stored_token.expires_at;
-                        println!("[TokenStorage] ✓ Successfully parsed token data");
-                        println!("[TokenStorage] Token expires at: {}", stored_token.expires_at);
+                        println!("[TokenStorage] V Successfully parsed token data");
+                        println!(
+                            "[TokenStorage] Token expires at: {}",
+                            stored_token.expires_at
+                        );
                         println!("[TokenStorage] Current time: {}", now);
                         println!("[TokenStorage] Token expired: {}", is_expired);
+                        // Populate cache
+                        if let Ok(mut guard) = self.cache.write() {
+                            *guard = Some(stored_token.clone());
+                        }
                         Ok(Some(stored_token))
                     }
                     Err(e) => {
-                        println!("[TokenStorage] ✗ Failed to parse token data: {}", e);
+                        println!("[TokenStorage] ? Failed to parse token data: {}", e);
                         Err(anyhow!("Failed to parse token data: {}", e))
                     }
                 }
             }
             Err(e) => {
-                println!("[TokenStorage] ✗ Failed to read token file: {}", e);
+                println!("[TokenStorage] ? Failed to read token file: {}", e);
                 Err(anyhow!("Failed to read token file: {}", e))
             }
         }
@@ -121,21 +151,30 @@ impl TokenStorage {
     /// Clear stored tokens
     pub fn clear_tokens(&self) -> Result<()> {
         let token_file = self.get_token_file_path();
-        println!("[TokenStorage] Attempting to clear tokens from: {:?}", token_file);
+        println!(
+            "[TokenStorage] Attempting to clear tokens from: {:?}",
+            token_file
+        );
 
         if token_file.exists() {
             match fs::remove_file(&token_file) {
                 Ok(_) => {
-                    println!("[TokenStorage] ✓ Successfully cleared token file");
+                    println!("[TokenStorage] V Successfully cleared token file");
+                    if let Ok(mut guard) = self.cache.write() {
+                        *guard = None;
+                    }
                     Ok(())
                 }
                 Err(e) => {
-                    println!("[TokenStorage] ✗ Failed to clear token file: {}", e);
+                    println!("[TokenStorage] ? Failed to clear token file: {}", e);
                     Err(anyhow!("Failed to clear token file: {}", e))
                 }
             }
         } else {
-            println!("[TokenStorage] ℹ No token file to clear");
+            println!("[TokenStorage] ? No token file to clear");
+            if let Ok(mut guard) = self.cache.write() {
+                *guard = None;
+            }
             Ok(())
         }
     }
@@ -176,11 +215,13 @@ impl TokenStorage {
     pub fn get_status(&self) -> Result<TokenStatus> {
         match self.load_tokens()? {
             Some(stored_token) => {
-                let is_expired = self.is_token_expired()?;
+                // Avoid a second disk read: compute directly here with a 60s buffer
+                let now = Utc::now();
+                let is_expired = (now + Duration::seconds(60)) >= stored_token.expires_at;
                 let time_until_expiry = if is_expired {
                     "Expired".to_string()
                 } else {
-                    let duration = stored_token.expires_at - Utc::now();
+                    let duration = stored_token.expires_at - now;
                     if duration.num_hours() > 0 {
                         format!("{}h {}m", duration.num_hours(), duration.num_minutes() % 60)
                     } else {
@@ -219,7 +260,7 @@ impl TokenStorage {
         let config_file = self.get_config_file_path();
         let config_json = serde_json::to_string_pretty(config)?;
         fs::write(&config_file, config_json)?;
-        println!("[TokenStorage] ✓ Saved configuration to: {:?}", config_file);
+        println!("[TokenStorage] V Saved configuration to: {:?}", config_file);
         Ok(())
     }
 
@@ -234,27 +275,13 @@ impl TokenStorage {
         match fs::read_to_string(&config_file) {
             Ok(content) => {
                 let config: ProxyConfig = serde_json::from_str(&content)?;
-                println!("[TokenStorage] ✓ Loaded configuration from: {:?}", config_file);
+                println!(
+                    "[TokenStorage] V Loaded configuration from: {:?}",
+                    config_file
+                );
                 Ok(Some(config))
             }
             Err(e) => Err(anyhow!("Failed to load configuration: {}", e)),
         }
-    }
-
-    /// Clear saved configuration
-    pub fn clear_config(&self) -> Result<()> {
-        let config_file = self.get_config_file_path();
-        if config_file.exists() {
-            fs::remove_file(&config_file)?;
-            println!("[TokenStorage] ✓ Cleared configuration file: {:?}", config_file);
-        }
-        Ok(())
-    }
-
-    /// Migrate from old storage locations (compatibility)
-    pub fn migrate_from_file(&self) -> Result<bool> {
-        // For now, this is a no-op since we're already using file storage
-        // Can be implemented later if we need to migrate from old locations
-        Ok(false)
     }
 }

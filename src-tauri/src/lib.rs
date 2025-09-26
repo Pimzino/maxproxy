@@ -1,6 +1,6 @@
 use anyhow::Result;
-use std::sync::Arc;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use tauri::Manager;
 use tokio::sync::Mutex;
 
@@ -55,6 +55,31 @@ impl<T> CommandResult<T> {
     }
 }
 
+// System information for bug reports
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SystemInfo {
+    pub os: String,
+    pub version: String,
+    pub edition: Option<String>,
+    pub arch: String,
+}
+
+#[tauri::command]
+async fn get_system_info() -> CommandResult<SystemInfo> {
+    let info = os_info::get();
+    let os = info.os_type().to_string();
+    let version = info.version().to_string();
+    let edition = info.edition().map(|e| e.to_string());
+    let arch = std::env::consts::ARCH.to_string();
+
+    CommandResult::success(SystemInfo {
+        os,
+        version,
+        edition,
+        arch,
+    })
+}
+
 // Automatic token renewal on startup
 async fn initialize_tokens_with_auto_renewal(
     oauth_manager: Arc<Mutex<OAuthManager>>,
@@ -74,8 +99,10 @@ async fn initialize_tokens_with_auto_renewal(
     match token_storage.get_status() {
         Ok(token_status) => {
             status.tokens_checked = true;
-            println!("[TokenInit] Token status checked - has_tokens: {}, is_expired: {}",
-                token_status.has_tokens, token_status.is_expired);
+            println!(
+                "[TokenInit] Token status checked - has_tokens: {}, is_expired: {}",
+                token_status.has_tokens, token_status.is_expired
+            );
 
             // If we have tokens and they're expired, try to refresh them
             if token_status.has_tokens && token_status.is_expired {
@@ -87,7 +114,10 @@ async fn initialize_tokens_with_auto_renewal(
                         let oauth_manager = oauth_manager.lock().await;
 
                         // Use retry mechanism with 3 attempts
-                        match oauth_manager.refresh_token_with_retry(&refresh_token, 3).await {
+                        match oauth_manager
+                            .refresh_token_with_retry(&refresh_token, 3)
+                            .await
+                        {
                             Ok(new_tokens) => {
                                 // Save the new tokens
                                 match token_storage.save_tokens(&new_tokens) {
@@ -96,7 +126,8 @@ async fn initialize_tokens_with_auto_renewal(
                                         println!("[TokenInit] ✓ Token renewal successful! Application ready.");
                                     }
                                     Err(e) => {
-                                        let error_msg = format!("Failed to save refreshed tokens: {}", e);
+                                        let error_msg =
+                                            format!("Failed to save refreshed tokens: {}", e);
                                         println!("[TokenInit] ✗ {}", error_msg);
                                         status.error = Some(error_msg);
                                     }
@@ -110,7 +141,8 @@ async fn initialize_tokens_with_auto_renewal(
                         }
                     }
                     Ok(None) => {
-                        let error_msg = "No refresh token available for automatic renewal".to_string();
+                        let error_msg =
+                            "No refresh token available for automatic renewal".to_string();
                         println!("[TokenInit] ✗ {}", error_msg);
                         status.error = Some(error_msg);
                     }
@@ -158,9 +190,20 @@ async fn exchange_oauth_code(
     let oauth_manager = state.oauth_manager.lock().await;
     match oauth_manager.exchange_code(&code).await {
         Ok(token_response) => {
-            match state.proxy_server.token_storage.save_tokens(&token_response) {
-                Ok(_) => Ok(CommandResult::success(())),
-                Err(e) => Ok(CommandResult::error(format!("Failed to save tokens: {}", e))),
+            match state
+                .proxy_server
+                .token_storage
+                .save_tokens(&token_response)
+            {
+                Ok(_) => {
+                    // Schedule auto-refresh based on new expiry
+                    state.proxy_server.schedule_token_refresh();
+                    Ok(CommandResult::success(()))
+                }
+                Err(e) => Ok(CommandResult::error(format!(
+                    "Failed to save tokens: {}",
+                    e
+                ))),
             }
         }
         Err(e) => Ok(CommandResult::error(e.to_string())),
@@ -174,18 +217,29 @@ async fn refresh_token(
     let oauth_manager = state.oauth_manager.lock().await;
 
     match state.proxy_server.token_storage.get_refresh_token() {
-        Ok(Some(refresh_token)) => {
-            match oauth_manager.refresh_token(&refresh_token).await {
-                Ok(token_response) => {
-                    match state.proxy_server.token_storage.save_tokens(&token_response) {
-                        Ok(_) => Ok(CommandResult::success(())),
-                        Err(e) => Ok(CommandResult::error(format!("Failed to save refreshed tokens: {}", e))),
+        Ok(Some(refresh_token)) => match oauth_manager.refresh_token(&refresh_token).await {
+            Ok(token_response) => {
+                match state
+                    .proxy_server
+                    .token_storage
+                    .save_tokens(&token_response)
+                {
+                    Ok(_) => {
+                        // Schedule auto-refresh based on new expiry
+                        state.proxy_server.schedule_token_refresh();
+                        Ok(CommandResult::success(()))
                     }
+                    Err(e) => Ok(CommandResult::error(format!(
+                        "Failed to save refreshed tokens: {}",
+                        e
+                    ))),
                 }
-                Err(e) => Ok(CommandResult::error(e.to_string())),
             }
-        }
-        Ok(None) => Ok(CommandResult::error("No refresh token available".to_string())),
+            Err(e) => Ok(CommandResult::error(e.to_string())),
+        },
+        Ok(None) => Ok(CommandResult::error(
+            "No refresh token available".to_string(),
+        )),
         Err(e) => Ok(CommandResult::error(e.to_string())),
     }
 }
@@ -206,7 +260,11 @@ async fn clear_tokens(
     state: tauri::State<'_, AppState>,
 ) -> Result<CommandResult<()>, tauri::Error> {
     match state.proxy_server.token_storage.clear_tokens() {
-        Ok(_) => Ok(CommandResult::success(())),
+        Ok(_) => {
+            // Cancel any scheduled token refresh
+            state.proxy_server.cancel_token_refresh();
+            Ok(CommandResult::success(()))
+        },
         Err(e) => Ok(CommandResult::error(e.to_string())),
     }
 }
@@ -266,9 +324,7 @@ async fn get_logs(
 }
 
 #[tauri::command]
-async fn clear_logs(
-    state: tauri::State<'_, AppState>,
-) -> Result<CommandResult<()>, tauri::Error> {
+async fn clear_logs(state: tauri::State<'_, AppState>) -> Result<CommandResult<()>, tauri::Error> {
     state.proxy_server.clear_logs();
     Ok(CommandResult::success(()))
 }
@@ -333,7 +389,8 @@ pub fn run() {
             update_proxy_config,
             get_logs,
             clear_logs,
-            get_init_status
+            get_init_status,
+            get_system_info
         ])
         .setup(|app| {
             // Perform token initialization asynchronously
@@ -345,13 +402,17 @@ pub fn run() {
                 let init_status_arc = app_state.init_status.clone();
 
                 // Run token initialization with auto-renewal
-                let status = initialize_tokens_with_auto_renewal(oauth_manager, token_storage).await;
+                let status =
+                    initialize_tokens_with_auto_renewal(oauth_manager, token_storage).await;
 
                 // Update the shared init status
                 {
                     let mut init_status = init_status_arc.lock().await;
                     *init_status = status;
                 }
+
+                // Schedule auto-refresh if tokens exist
+                app_state.proxy_server.schedule_token_refresh();
             });
 
             #[cfg(debug_assertions)]
@@ -360,8 +421,9 @@ pub fn run() {
                 webview_window.open_devtools();
 
                 // Disable WebView2 caching in development mode
-                webview_window.eval(
-                    r#"
+                webview_window
+                    .eval(
+                        r#"
                     console.log('🚫 Disabling WebView2 caching for development...');
 
                     // Disable service workers
@@ -409,12 +471,14 @@ pub fn run() {
                     setInterval(refreshCSS, 10000);
 
                     console.log('✅ WebView2 cache bypassing enabled');
-                    "#
-                ).ok();
+                    "#,
+                    )
+                    .ok();
 
                 // Add force reload capability (Ctrl+Shift+R for hard reload)
-                webview_window.eval(
-                    r#"
+                webview_window
+                    .eval(
+                        r#"
                     document.addEventListener('keydown', function(e) {
                         if (e.ctrlKey && e.shiftKey && e.key === 'R') {
                             console.log('🔄 Force reloading WebView...');
@@ -423,8 +487,9 @@ pub fn run() {
                         }
                     });
                     console.log('🎯 Force reload with Ctrl+Shift+R enabled');
-                    "#
-                ).ok();
+                    "#,
+                    )
+                    .ok();
             }
             Ok(())
         })
