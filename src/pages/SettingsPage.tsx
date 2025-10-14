@@ -12,7 +12,10 @@ import {
   Info,
   Globe,
   Shield,
-  Zap
+  Zap,
+  Monitor,
+  PlayCircle,
+  Power
 } from 'lucide-react';
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -21,14 +24,17 @@ import { Label } from '@/components/ui/label';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Badge } from '@/components/ui/badge';
 import { useAppContext } from '@/contexts/AppContext';
-import { getProxyConfig, updateProxyConfig, getProxyStatus } from '@/lib/api';
-import { ProxyConfig } from '@/types';
+import { getProxyConfig, updateProxyConfig, getProxyStatus, getSystemInfo } from '@/lib/api';
+import { ProxyConfig, SystemInfo } from '@/types';
 
 const configSchema = z.object({
   port: z.number().int().min(1).max(65535),
   bind_address: z.string().min(1),
   debug_mode: z.boolean(),
   openai_compatible: z.boolean(),
+  start_minimized: z.boolean(),
+  auto_start_proxy: z.boolean(),
+  launch_on_startup: z.boolean(),
 });
 
 type ConfigFormData = z.infer<typeof configSchema>;
@@ -36,6 +42,9 @@ type ConfigFormData = z.infer<typeof configSchema>;
 const SettingsPage: React.FC = () => {
   const { state, refreshAppState } = useAppContext();
   const [message, setMessage] = useState<{ type: 'success' | 'error' | 'info'; text: string } | null>(null);
+  const [launchLabel, setLaunchLabel] = useState('Launch on Startup');
+  const [launchDescription, setLaunchDescription] = useState('Add MaxProxy to your operating system\'s startup apps list.');
+  const [launchBadge, setLaunchBadge] = useState('Startup');
 
   const {
     register,
@@ -50,6 +59,9 @@ const SettingsPage: React.FC = () => {
       bind_address: '0.0.0.0',
       debug_mode: false,
       openai_compatible: false,
+      start_minimized: false,
+      auto_start_proxy: false,
+      launch_on_startup: false,
     },
   });
 
@@ -81,6 +93,36 @@ const SettingsPage: React.FC = () => {
   const currentConfig = configData?.data ?? state.proxyConfig;
   const serverRunning = statusData?.data ?? state.proxyRunning;
 
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await getSystemInfo();
+        if (!res.success || !res.data) return;
+        const sys: SystemInfo = res.data;
+        const os = sys.os.toLowerCase();
+        if (os.includes('windows')) {
+          setLaunchLabel('Launch with Windows');
+          setLaunchDescription('Add MaxProxy to the Windows startup apps list.');
+          setLaunchBadge('Windows');
+        } else if (os.includes('mac')) {
+          setLaunchLabel('Launch at Login');
+          setLaunchDescription('Open MaxProxy automatically when you sign in to macOS.');
+          setLaunchBadge('Login Item');
+        } else if (os.includes('linux')) {
+          setLaunchLabel('Launch on Startup');
+          setLaunchDescription('Start MaxProxy alongside your desktop session.');
+          setLaunchBadge('Startup');
+        } else {
+          setLaunchLabel('Launch on Startup');
+          setLaunchDescription('Start MaxProxy automatically with your device.');
+          setLaunchBadge('Startup');
+        }
+      } catch {
+        // retain defaults
+      }
+    })();
+  }, []);
+
   // Update form when config data is loaded
   useEffect(() => {
     if (currentConfig) {
@@ -89,6 +131,9 @@ const SettingsPage: React.FC = () => {
         bind_address: currentConfig.bind_address,
         debug_mode: currentConfig.debug_mode,
         openai_compatible: currentConfig.openai_compatible,
+        start_minimized: currentConfig.start_minimized,
+        auto_start_proxy: currentConfig.auto_start_proxy,
+        launch_on_startup: currentConfig.launch_on_startup,
       });
     }
   }, [currentConfig, reset]);
@@ -105,6 +150,9 @@ const SettingsPage: React.FC = () => {
         bind_address: currentConfig.bind_address,
         debug_mode: currentConfig.debug_mode,
         openai_compatible: currentConfig.openai_compatible,
+        start_minimized: currentConfig.start_minimized,
+        auto_start_proxy: currentConfig.auto_start_proxy,
+        launch_on_startup: currentConfig.launch_on_startup,
       });
       setMessage(null);
     }
@@ -258,6 +306,87 @@ const SettingsPage: React.FC = () => {
                   </Alert>
                 )}
               </div>
+            </CardContent>
+          </Card>
+
+          {/* Application Preferences Card */}
+          <Card className="lg:col-span-1">
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2 text-lg">
+                <Monitor className="h-4 w-4" />
+                Application Preferences
+              </CardTitle>
+              <CardDescription>
+                Control how MaxProxy behaves when it launches
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div className="space-y-3">
+                <div className="flex items-center justify-between p-3 border rounded-lg">
+                  <div className="flex-1">
+                    <div className="flex items-center gap-2">
+                      <Label htmlFor="start_minimized">Start Minimized</Label>
+                    </div>
+                    <p className="text-sm text-muted-foreground mt-1">
+                      Keep the window hidden and accessible from the tray when the app first opens.
+                    </p>
+                  </div>
+                  <input
+                    id="start_minimized"
+                    type="checkbox"
+                    {...register('start_minimized')}
+                    className="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                  />
+                </div>
+
+                <div className="flex items-center justify-between p-3 border rounded-lg">
+                  <div className="flex-1">
+                    <div className="flex items-center gap-2">
+                      <Label htmlFor="auto_start_proxy">Start Proxy on Launch</Label>
+                      <Badge variant="outline" className="text-xs">Convenience</Badge>
+                    </div>
+                    <p className="text-sm text-muted-foreground mt-1">
+                      Automatically run the proxy service when MaxProxy starts.
+                    </p>
+                  </div>
+                  <input
+                    id="auto_start_proxy"
+                    type="checkbox"
+                    {...register('auto_start_proxy')}
+                    className="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                  />
+                </div>
+
+                <div className="flex items-center justify-between p-3 border rounded-lg">
+                  <div className="flex-1">
+                    <div className="flex items-center gap-2">
+                      <Label htmlFor="launch_on_startup">{launchLabel}</Label>
+                      <Badge variant="secondary" className="text-xs flex items-center gap-1">
+                        <Power className="h-3 w-3" />
+                        {launchBadge}
+                      </Badge>
+                    </div>
+                    <p className="text-sm text-muted-foreground mt-1">
+                      {launchDescription}
+                    </p>
+                  </div>
+                  <input
+                    id="launch_on_startup"
+                    type="checkbox"
+                    {...register('launch_on_startup')}
+                    className="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                  />
+                </div>
+              </div>
+
+              {watchedValues.auto_start_proxy && !serverRunning && (
+                <Alert className="mt-3">
+                  <PlayCircle className="h-4 w-4" />
+                  <AlertDescription>
+                    The proxy will start automatically the next time the app launches. You can also start it now from the tray menu.
+                  </AlertDescription>
+                </Alert>
+              )}
             </CardContent>
           </Card>
         </div>

@@ -1,7 +1,16 @@
 use anyhow::Result;
+use parking_lot::Mutex as SyncMutex;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
-use tauri::Manager;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use tauri::{
+    menu::{CheckMenuItem, MenuBuilder, MenuItem},
+    tray::{MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    AppHandle, Manager, WindowEvent, Wry,
+};
+use tauri_plugin_autostart::{MacosLauncher, ManagerExt as AutostartManagerExt};
 use tokio::sync::Mutex;
 
 mod oauth;
@@ -12,11 +21,104 @@ use oauth::OAuthManager;
 use proxy::{LogEntry, ProxyConfig, ProxyServer};
 use storage::{TokenStatus, TokenStorage};
 
+const TRAY_ID: &str = "maxproxy_tray";
+const TRAY_TOGGLE_WINDOW_ID: &str = "tray_toggle_window";
+const TRAY_START_PROXY_ID: &str = "tray_start_proxy";
+const TRAY_STOP_PROXY_ID: &str = "tray_stop_proxy";
+const TRAY_QUIT_ID: &str = "tray_quit";
+const TRAY_PREF_START_MINIMIZED_ID: &str = "tray_pref_start_minimized";
+const TRAY_PREF_AUTO_START_PROXY_ID: &str = "tray_pref_auto_start_proxy";
+const TRAY_PREF_LAUNCH_ON_STARTUP_ID: &str = "tray_pref_launch_on_startup";
+
+#[cfg(target_os = "windows")]
+const LAUNCH_MENU_LABEL: &str = "Launch with Windows";
+#[cfg(target_os = "macos")]
+const LAUNCH_MENU_LABEL: &str = "Launch at Login";
+#[cfg(target_os = "linux")]
+const LAUNCH_MENU_LABEL: &str = "Launch on Startup";
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+const LAUNCH_MENU_LABEL: &str = "Launch on Startup";
+
+type Runtime = Wry;
+type TrayMenuItem = MenuItem<Runtime>;
+type TrayCheckItem = CheckMenuItem<Runtime>;
+
 // Global application state
 pub struct AppState {
     oauth_manager: Arc<Mutex<OAuthManager>>,
     proxy_server: Arc<ProxyServer>,
     init_status: Arc<Mutex<InitStatus>>,
+    tray_menu_state: Arc<SyncMutex<Option<TrayMenuState>>>,
+    allow_quit: Arc<AtomicBool>,
+}
+
+struct TrayMenuState {
+    toggle_window_item: TrayMenuItem,
+    start_proxy_item: TrayMenuItem,
+    stop_proxy_item: TrayMenuItem,
+    start_minimized_item: TrayCheckItem,
+    auto_start_proxy_item: TrayCheckItem,
+    launch_on_startup_item: TrayCheckItem,
+}
+
+impl TrayMenuState {
+    fn new(
+        toggle_window_item: TrayMenuItem,
+        start_proxy_item: TrayMenuItem,
+        stop_proxy_item: TrayMenuItem,
+        start_minimized_item: TrayCheckItem,
+        auto_start_proxy_item: TrayCheckItem,
+        launch_on_startup_item: TrayCheckItem,
+    ) -> Self {
+        Self {
+            toggle_window_item,
+            start_proxy_item,
+            stop_proxy_item,
+            start_minimized_item,
+            auto_start_proxy_item,
+            launch_on_startup_item,
+        }
+    }
+
+    fn set_proxy_running(&self, running: bool) {
+        if let Err(e) = self.start_proxy_item.set_enabled(!running) {
+            eprintln!("[Tray] Failed to update start item state: {}", e);
+        }
+
+        if let Err(e) = self.stop_proxy_item.set_enabled(running) {
+            eprintln!("[Tray] Failed to update stop item state: {}", e);
+        }
+    }
+
+    fn set_preferences(&self, config: &ProxyConfig) {
+        if let Err(e) = self.start_minimized_item.set_checked(config.start_minimized) {
+            eprintln!("[Tray] Failed to update start minimized toggle: {}", e);
+        }
+        if let Err(e) = self
+            .auto_start_proxy_item
+            .set_checked(config.auto_start_proxy)
+        {
+            eprintln!("[Tray] Failed to update auto start proxy toggle: {}", e);
+        }
+        if let Err(e) = self
+            .launch_on_startup_item
+            .set_checked(config.launch_on_startup)
+        {
+            eprintln!("[Tray] Failed to update launch on startup toggle: {}", e);
+        }
+    }
+
+    fn set_window_visible(&self, visible: bool) {
+        let label = if visible {
+            "Hide MaxProxy"
+        } else {
+            "Show MaxProxy"
+        };
+
+        if let Err(e) = self.toggle_window_item.set_text(label) {
+            eprintln!("[Tray] Failed to update window toggle label: {}", e);
+        }
+    }
 }
 
 // App initialization status
@@ -272,20 +374,28 @@ async fn clear_tokens(
 // Proxy Server Commands
 #[tauri::command]
 async fn start_proxy_server(
+    app: AppHandle<Runtime>,
     state: tauri::State<'_, AppState>,
 ) -> Result<CommandResult<()>, tauri::Error> {
     match state.proxy_server.start().await {
-        Ok(_) => Ok(CommandResult::success(())),
+        Ok(_) => {
+            update_tray_proxy_state(&app, true);
+            Ok(CommandResult::success(()))
+        }
         Err(e) => Ok(CommandResult::error(e.to_string())),
     }
 }
 
 #[tauri::command]
 async fn stop_proxy_server(
+    app: AppHandle<Runtime>,
     state: tauri::State<'_, AppState>,
 ) -> Result<CommandResult<()>, tauri::Error> {
     match state.proxy_server.stop().await {
-        Ok(_) => Ok(CommandResult::success(())),
+        Ok(_) => {
+            update_tray_proxy_state(&app, false);
+            Ok(CommandResult::success(()))
+        }
         Err(e) => Ok(CommandResult::error(e.to_string())),
     }
 }
@@ -306,13 +416,19 @@ async fn get_proxy_config(
 
 #[tauri::command]
 async fn update_proxy_config(
+    app: AppHandle<Runtime>,
     config: ProxyConfig,
     state: tauri::State<'_, AppState>,
 ) -> Result<CommandResult<()>, tauri::Error> {
-    match state.proxy_server.update_config(config) {
-        Ok(_) => Ok(CommandResult::success(())),
-        Err(e) => Ok(CommandResult::error(e.to_string())),
+    let previous = state.proxy_server.get_config();
+
+    if let Err(e) = state.proxy_server.update_config(config.clone()) {
+        return Ok(CommandResult::error(e.to_string()));
     }
+
+    apply_config_side_effects(&app, &state, &previous, &config);
+
+    Ok(CommandResult::success(()))
 }
 
 // Logging Commands
@@ -365,16 +481,22 @@ pub fn run() {
         error: None,
     }));
 
+    let tray_menu_state = Arc::new(SyncMutex::new(None));
+    let allow_quit = Arc::new(AtomicBool::new(false));
+
     let app_state = AppState {
         oauth_manager: oauth_manager.clone(),
         proxy_server: proxy_server.clone(),
         init_status: init_status.clone(),
+        tray_menu_state: tray_menu_state.clone(),
+        allow_quit: allow_quit.clone(),
     };
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_autostart::init(MacosLauncher::LaunchAgent, None))
         .manage(app_state)
         .invoke_handler(tauri::generate_handler![
             start_oauth_flow,
@@ -393,10 +515,43 @@ pub fn run() {
             get_system_info
         ])
         .setup(|app| {
-            // Perform token initialization asynchronously
-            let app_handle = app.handle().clone();
+            setup_system_tray(app)?;
+
+            let app_handle = app.handle();
+
+            if let Some(main_window) = app.get_webview_window("main") {
+                let allow_quit_flag = app.state::<AppState>().allow_quit.clone();
+                let app_handle_for_event = app_handle.clone();
+                let window_clone = main_window.clone();
+
+                main_window.on_window_event(move |event| {
+                    if let WindowEvent::CloseRequested { api, .. } = event {
+                        if !allow_quit_flag.load(Ordering::Relaxed) {
+                            api.prevent_close();
+                            if let Err(e) = window_clone.hide() {
+                                eprintln!("[Tray] Failed to hide window: {}", e);
+                            }
+                            update_tray_window_state(&app_handle_for_event, false);
+                        }
+                    }
+                });
+            }
+
+            // Apply persisted preference settings
+            let config_snapshot = {
+                let state = app.state::<AppState>();
+                state.proxy_server.get_config()
+            };
+
+    {
+        let state_ref = app.state::<AppState>();
+        apply_config_side_effects(&app_handle, &state_ref, &ProxyConfig::default(), &config_snapshot);
+    }
+
+    // Perform token initialization asynchronously
+    let app_handle_for_init = app.handle().clone();
             tauri::async_runtime::spawn(async move {
-                let app_state = app_handle.state::<AppState>();
+                let app_state = app_handle_for_init.state::<AppState>();
                 let token_storage = &app_state.proxy_server.token_storage;
                 let oauth_manager = app_state.oauth_manager.clone();
                 let init_status_arc = app_state.init_status.clone();
@@ -495,4 +650,314 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+fn setup_system_tray(app: &tauri::App) -> tauri::Result<()> {
+    let app_handle: AppHandle<Runtime> = app.handle().clone();
+    let config_snapshot = {
+        let state = app.state::<AppState>();
+        state.proxy_server.get_config()
+    };
+
+    let toggle_item = TrayMenuItem::with_id(
+        &app_handle,
+        TRAY_TOGGLE_WINDOW_ID,
+        "Hide MaxProxy",
+        true,
+        None::<&str>,
+    )?;
+    let start_item = TrayMenuItem::with_id(
+        &app_handle,
+        TRAY_START_PROXY_ID,
+        "Start Proxy",
+        true,
+        None::<&str>,
+    )?;
+    let stop_item = TrayMenuItem::with_id(
+        &app_handle,
+        TRAY_STOP_PROXY_ID,
+        "Stop Proxy",
+        true,
+        None::<&str>,
+    )?;
+    let start_minimized_item = TrayCheckItem::with_id(
+        &app_handle,
+        TRAY_PREF_START_MINIMIZED_ID,
+        "Start Minimized",
+        true,
+        config_snapshot.start_minimized,
+        None::<&str>,
+    )?;
+    let auto_start_proxy_item = TrayCheckItem::with_id(
+        &app_handle,
+        TRAY_PREF_AUTO_START_PROXY_ID,
+        "Start Proxy on Launch",
+        true,
+        config_snapshot.auto_start_proxy,
+        None::<&str>,
+    )?;
+    let launch_on_startup_item = TrayCheckItem::with_id(
+        &app_handle,
+        TRAY_PREF_LAUNCH_ON_STARTUP_ID,
+        LAUNCH_MENU_LABEL,
+        true,
+        config_snapshot.launch_on_startup,
+        None::<&str>,
+    )?;
+    let quit_item =
+        TrayMenuItem::with_id(&app_handle, TRAY_QUIT_ID, "Quit", true, None::<&str>)?;
+
+    let menu = MenuBuilder::new(&app_handle)
+        .item(&toggle_item)
+        .separator()
+        .item(&start_item)
+        .item(&stop_item)
+        .separator()
+        .item(&start_minimized_item)
+        .item(&auto_start_proxy_item)
+        .item(&launch_on_startup_item)
+        .separator()
+        .item(&quit_item)
+        .build()?;
+
+    {
+        let app_state = app.state::<AppState>();
+        let mut tray_menu_state = app_state.tray_menu_state.lock();
+        *tray_menu_state = Some(TrayMenuState::new(
+            toggle_item.clone(),
+            start_item.clone(),
+            stop_item.clone(),
+            start_minimized_item.clone(),
+            auto_start_proxy_item.clone(),
+            launch_on_startup_item.clone(),
+        ));
+    }
+
+    let mut tray_builder = TrayIconBuilder::with_id(TRAY_ID)
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .tooltip("MaxProxy Controls");
+
+    if let Some(icon) = app.default_window_icon() {
+        tray_builder = tray_builder.icon(icon.clone());
+    }
+
+    let tray_builder = tray_builder
+        .on_menu_event(|app, event| {
+            match event.id().as_ref() {
+                TRAY_TOGGLE_WINDOW_ID => {
+                    let app_handle = app.clone();
+                    toggle_main_window(&app_handle);
+                }
+                TRAY_START_PROXY_ID => {
+                    let app_handle = app.clone();
+                    tauri::async_runtime::spawn(async move {
+                        let proxy_server = app_handle.state::<AppState>().proxy_server.clone();
+                        match proxy_server.start().await {
+                            Ok(_) => {
+                                update_tray_proxy_state(&app_handle, true);
+                            }
+                            Err(e) => {
+                                eprintln!("[Tray] Failed to start proxy: {}", e);
+                            }
+                        }
+                    });
+                }
+                TRAY_STOP_PROXY_ID => {
+                    let app_handle = app.clone();
+                    tauri::async_runtime::spawn(async move {
+                        let proxy_server = app_handle.state::<AppState>().proxy_server.clone();
+                        match proxy_server.stop().await {
+                            Ok(_) => {
+                                update_tray_proxy_state(&app_handle, false);
+                            }
+                            Err(e) => {
+                                eprintln!("[Tray] Failed to stop proxy: {}", e);
+                            }
+                        }
+                    });
+                }
+                TRAY_PREF_START_MINIMIZED_ID => {
+                    let app_handle = app.clone();
+                    let state = app.state::<AppState>();
+                    let previous = state.proxy_server.get_config();
+                    let mut updated = previous.clone();
+                    updated.start_minimized = !previous.start_minimized;
+                    if let Err(e) = state.proxy_server.update_config(updated.clone()) {
+                        eprintln!("[Tray] Failed to update start minimized preference: {}", e);
+                        update_tray_preferences(&app_handle, &previous);
+                    } else {
+                        apply_config_side_effects(&app_handle, &state, &previous, &updated);
+                    }
+                }
+                TRAY_PREF_AUTO_START_PROXY_ID => {
+                    let app_handle = app.clone();
+                    let state = app.state::<AppState>();
+                    let previous = state.proxy_server.get_config();
+                    let mut updated = previous.clone();
+                    updated.auto_start_proxy = !previous.auto_start_proxy;
+                    if let Err(e) = state.proxy_server.update_config(updated.clone()) {
+                        eprintln!("[Tray] Failed to update auto start proxy preference: {}", e);
+                        update_tray_preferences(&app_handle, &previous);
+                    } else {
+                        apply_config_side_effects(&app_handle, &state, &previous, &updated);
+                    }
+                }
+                TRAY_PREF_LAUNCH_ON_STARTUP_ID => {
+                    let app_handle = app.clone();
+                    let state = app.state::<AppState>();
+                    let previous = state.proxy_server.get_config();
+                    let mut updated = previous.clone();
+                    updated.launch_on_startup = !previous.launch_on_startup;
+                    if let Err(e) = state.proxy_server.update_config(updated.clone()) {
+                        eprintln!("[Tray] Failed to update launch on startup preference: {}", e);
+                        update_tray_preferences(&app_handle, &previous);
+                    } else {
+                        apply_config_side_effects(&app_handle, &state, &previous, &updated);
+                    }
+                }
+                TRAY_QUIT_ID => {
+                    let app_handle = app.clone();
+                    let allow_quit_flag = app.state::<AppState>().allow_quit.clone();
+                    let proxy_server = app.state::<AppState>().proxy_server.clone();
+                    tauri::async_runtime::spawn(async move {
+                        allow_quit_flag.store(true, Ordering::Relaxed);
+                        if proxy_server.is_running() {
+                            if let Err(e) = proxy_server.stop().await {
+                                eprintln!("[Tray] Failed to stop proxy during quit: {}", e);
+                            }
+                        }
+                        app_handle.exit(0);
+                    });
+                }
+                _ => {}
+            }
+        })
+        .on_tray_icon_event(|tray, event: TrayIconEvent| {
+            if let TrayIconEvent::Click {
+                button,
+                button_state,
+                ..
+            } = event
+            {
+                if matches!(button, tauri::tray::MouseButton::Left)
+                    && button_state == MouseButtonState::Up
+                {
+                    let app_handle = tray.app_handle();
+                    toggle_main_window(&app_handle);
+                }
+            }
+        });
+
+    tray_builder.build(&app_handle)?;
+
+    let is_running = {
+        let app_state = app.state::<AppState>();
+        app_state.proxy_server.is_running()
+    };
+
+    update_tray_proxy_state(&app_handle, is_running);
+    let window_visible = match app.get_webview_window("main") {
+        Some(window) => window.is_visible().unwrap_or(true),
+        None => true,
+    };
+    update_tray_window_state(&app_handle, window_visible);
+
+    Ok(())
+}
+
+fn with_tray_state<F>(app: &AppHandle<Runtime>, f: F)
+where
+    F: FnOnce(&TrayMenuState),
+{
+    let app_state = app.state::<AppState>();
+    let guard = app_state.tray_menu_state.lock();
+    if let Some(tray_state) = guard.as_ref() {
+        f(tray_state);
+    }
+}
+
+fn update_tray_proxy_state(app: &AppHandle<Runtime>, running: bool) {
+    with_tray_state(app, |tray_state| {
+        tray_state.set_proxy_running(running);
+    });
+}
+
+fn update_tray_preferences(app: &AppHandle<Runtime>, config: &ProxyConfig) {
+    with_tray_state(app, |tray_state| {
+        tray_state.set_preferences(config);
+    });
+}
+
+fn update_tray_window_state(app: &AppHandle<Runtime>, visible: bool) {
+    with_tray_state(app, |tray_state| {
+        tray_state.set_window_visible(visible);
+    });
+}
+
+fn apply_config_side_effects(
+    app: &AppHandle<Runtime>,
+    state: &tauri::State<'_, AppState>,
+    previous: &ProxyConfig,
+    config: &ProxyConfig,
+) {
+    if config.launch_on_startup != previous.launch_on_startup {
+        let autostart_manager = app.autolaunch();
+        let result = if config.launch_on_startup {
+            autostart_manager.enable()
+        } else {
+            autostart_manager.disable()
+        };
+        if let Err(e) = result {
+            eprintln!("[Autostart] Failed to update launch preference: {}", e);
+        }
+    }
+
+    if config.start_minimized && !previous.start_minimized {
+        if let Some(window) = app.get_webview_window("main") {
+            if let Err(e) = window.hide() {
+                eprintln!("[Tray] Failed to hide window for start minimized preference: {}", e);
+            } else {
+                update_tray_window_state(app, false);
+            }
+        }
+    }
+
+    if config.auto_start_proxy && !previous.auto_start_proxy {
+        let proxy_server = state.proxy_server.clone();
+        let app_handle = app.clone();
+        tauri::async_runtime::spawn(async move {
+            if !proxy_server.is_running() {
+                match proxy_server.start().await {
+                    Ok(_) => update_tray_proxy_state(&app_handle, true),
+                    Err(e) => eprintln!("[Autostart] Failed to start proxy automatically: {}", e),
+                }
+            }
+        });
+    }
+
+    update_tray_preferences(app, config);
+}
+
+fn toggle_main_window(app: &AppHandle<Runtime>) {
+    if let Some(window) = app.get_webview_window("main") {
+        match window.is_visible() {
+            Ok(true) => {
+                if let Err(e) = window.hide() {
+                    eprintln!("[Tray] Failed to hide window: {}", e);
+                } else {
+                    update_tray_window_state(app, false);
+                }
+            }
+            Ok(false) | Err(_) => {
+                if let Err(e) = window.show() {
+                    eprintln!("[Tray] Failed to show window: {}", e);
+                } else {
+                    let _ = window.unminimize();
+                    let _ = window.set_focus();
+                    update_tray_window_state(app, true);
+                }
+            }
+        }
+    }
 }

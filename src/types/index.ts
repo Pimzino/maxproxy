@@ -25,6 +25,9 @@ export interface ProxyConfig {
   bind_address: string;
   debug_mode: boolean;
   openai_compatible: boolean;
+  start_minimized: boolean;
+  auto_start_proxy: boolean;
+  launch_on_startup: boolean;
 }
 
 export type LogLevel = 'Error' | 'Warning' | 'Info' | 'Debug';

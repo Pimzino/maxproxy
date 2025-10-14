@@ -59,6 +59,12 @@ pub struct ProxyConfig {
     pub bind_address: String,
     pub debug_mode: bool,
     pub openai_compatible: bool,
+    #[serde(default)]
+    pub start_minimized: bool,
+    #[serde(default)]
+    pub auto_start_proxy: bool,
+    #[serde(default)]
+    pub launch_on_startup: bool,
 }
 
 impl Default for ProxyConfig {
@@ -68,6 +74,9 @@ impl Default for ProxyConfig {
             bind_address: "0.0.0.0".to_string(),
             debug_mode: false,
             openai_compatible: false,
+            start_minimized: false,
+            auto_start_proxy: false,
+            launch_on_startup: false,
         }
     }
 }
@@ -2483,12 +2492,24 @@ fn map_openai_tool_choice(choice: &Value) -> Option<Value> {
 }
 
 fn inject_claude_code_system_message(request: &mut AnthropicMessageRequest) {
+    // Count existing cache_control blocks so we stay within Anthropic's limit of 4
+    let existing_cache_control_blocks = count_cache_control_blocks(request);
+
     // The exact spoof message from Claude Code - must be first system message
-    let claude_code_spoof_element = json!({
+    let mut claude_code_spoof_element = json!({
         "type": "text",
-        "text": "You are Claude Code, Anthropic's official CLI for Claude.",
-        "cache_control": {"type": "ephemeral"}
+        "text": "You are Claude Code, Anthropic's official CLI for Claude."
     });
+
+    // Only add cache_control metadata if it will not exceed the API limit
+    if existing_cache_control_blocks < 4 {
+        if let Value::Object(obj) = &mut claude_code_spoof_element {
+            obj.insert(
+                "cache_control".to_string(),
+                json!({"type": "ephemeral"}),
+            );
+        }
+    }
 
     // Claude Code uses array format for system messages
     if let Some(existing_system) = &mut request.system {
@@ -2498,6 +2519,36 @@ fn inject_claude_code_system_message(request: &mut AnthropicMessageRequest) {
         // No existing system message - create array with just the spoof
         request.system = Some(vec![claude_code_spoof_element]);
     }
+}
+
+fn count_cache_control_blocks(request: &AnthropicMessageRequest) -> usize {
+    fn count_in_value(value: &Value) -> usize {
+        match value {
+            Value::Object(map) => {
+                let mut count = if map.contains_key("cache_control") { 1 } else { 0 };
+                for inner_value in map.values() {
+                    count += count_in_value(inner_value);
+                }
+                count
+            }
+            Value::Array(items) => items.iter().map(count_in_value).sum(),
+            _ => 0,
+        }
+    }
+
+    let mut total = 0;
+
+    if let Some(system_messages) = &request.system {
+        for message in system_messages {
+            total += count_in_value(message);
+        }
+    }
+
+    for message in &request.messages {
+        total += count_in_value(message);
+    }
+
+    total
 }
 
 fn sanitize_anthropic_request(request: &mut AnthropicMessageRequest) {
