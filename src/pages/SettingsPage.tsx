@@ -15,7 +15,9 @@ import {
   Zap,
   Monitor,
   PlayCircle,
-  Power
+  Power,
+  Lock,
+  Key
 } from 'lucide-react';
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -26,16 +28,40 @@ import { Badge } from '@/components/ui/badge';
 import { useAppContext } from '@/contexts/AppContext';
 import { getProxyConfig, updateProxyConfig, getProxyStatus, getSystemInfo } from '@/lib/api';
 import { ProxyConfig, SystemInfo } from '@/types';
+import { open } from '@tauri-apps/plugin-dialog';
 
-const configSchema = z.object({
-  port: z.number().int().min(1).max(65535),
-  bind_address: z.string().min(1),
-  debug_mode: z.boolean(),
-  openai_compatible: z.boolean(),
-  start_minimized: z.boolean(),
-  auto_start_proxy: z.boolean(),
-  launch_on_startup: z.boolean(),
-});
+const configSchema = z
+  .object({
+    port: z.number().int().min(1).max(65535),
+    bind_address: z.string().min(1),
+    debug_mode: z.boolean(),
+    openai_compatible: z.boolean(),
+    start_minimized: z.boolean(),
+    auto_start_proxy: z.boolean(),
+    launch_on_startup: z.boolean(),
+    enable_tls: z.boolean(),
+    tls_mode: z.enum(['self_signed', 'custom']),
+    tls_cert_path: z.string().optional().nullable(),
+    tls_key_path: z.string().optional().nullable(),
+  })
+  .superRefine((data, ctx) => {
+    if (data.enable_tls && data.tls_mode === 'custom') {
+      if (!data.tls_cert_path || data.tls_cert_path.trim() === '') {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'Certificate path is required when using custom TLS.',
+          path: ['tls_cert_path'],
+        });
+      }
+      if (!data.tls_key_path || data.tls_key_path.trim() === '') {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'Private key path is required when using custom TLS.',
+          path: ['tls_key_path'],
+        });
+      }
+    }
+  });
 
 type ConfigFormData = z.infer<typeof configSchema>;
 
@@ -50,6 +76,8 @@ const SettingsPage: React.FC = () => {
     register,
     handleSubmit,
     reset,
+    setValue,
+    trigger,
     formState: { errors, isDirty },
     watch,
   } = useForm<ConfigFormData>({
@@ -62,6 +90,10 @@ const SettingsPage: React.FC = () => {
       start_minimized: false,
       auto_start_proxy: false,
       launch_on_startup: false,
+      enable_tls: false,
+      tls_mode: 'self_signed',
+      tls_cert_path: '',
+      tls_key_path: '',
     },
   });
 
@@ -134,13 +166,36 @@ const SettingsPage: React.FC = () => {
         start_minimized: currentConfig.start_minimized,
         auto_start_proxy: currentConfig.auto_start_proxy,
         launch_on_startup: currentConfig.launch_on_startup,
+        enable_tls: currentConfig.enable_tls ?? false,
+        tls_mode: currentConfig.tls_mode ?? 'self_signed',
+        tls_cert_path: currentConfig.tls_cert_path ?? '',
+        tls_key_path: currentConfig.tls_key_path ?? '',
       });
     }
   }, [currentConfig, reset]);
 
   const onSubmit = (data: ConfigFormData) => {
     setMessage(null);
-    updateConfigMutation.mutate(data);
+    const trimmedCert = data.tls_cert_path?.trim() ?? '';
+    const trimmedKey = data.tls_key_path?.trim() ?? '';
+    const payload: ProxyConfig = {
+      ...data,
+      tls_cert_path:
+        data.enable_tls && data.tls_mode === 'custom' && trimmedCert
+          ? trimmedCert
+          : undefined,
+      tls_key_path:
+        data.enable_tls && data.tls_mode === 'custom' && trimmedKey
+          ? trimmedKey
+          : undefined,
+    };
+
+    if (data.tls_mode === 'self_signed') {
+      payload.tls_cert_path = undefined;
+      payload.tls_key_path = undefined;
+    }
+
+    updateConfigMutation.mutate(payload);
   };
 
   const handleReset = () => {
@@ -153,12 +208,65 @@ const SettingsPage: React.FC = () => {
         start_minimized: currentConfig.start_minimized,
         auto_start_proxy: currentConfig.auto_start_proxy,
         launch_on_startup: currentConfig.launch_on_startup,
+        enable_tls: currentConfig.enable_tls ?? false,
+        tls_mode: currentConfig.tls_mode ?? 'self_signed',
+        tls_cert_path: currentConfig.tls_cert_path ?? '',
+        tls_key_path: currentConfig.tls_key_path ?? '',
       });
       setMessage(null);
     }
   };
 
   const watchedValues = watch();
+  const currentScheme = watchedValues.enable_tls ? 'https' : 'http';
+  const isTlsEnabled = watchedValues.enable_tls;
+  const isCustomTls = isTlsEnabled && watchedValues.tls_mode === 'custom';
+  const selfSignedCertPath =
+    currentConfig?.tls_cert_path ??
+    (typeof watchedValues.tls_cert_path === 'string'
+      ? watchedValues.tls_cert_path
+      : '');
+  const selfSignedKeyPath =
+    currentConfig?.tls_key_path ??
+    (typeof watchedValues.tls_key_path === 'string'
+      ? watchedValues.tls_key_path
+      : '');
+
+  const handleBrowseCert = async () => {
+    if (!isCustomTls) return;
+    const selected = await open({
+      multiple: false,
+      filters: [
+        {
+          name: 'Certificate',
+          extensions: ['pem', 'crt', 'cer'],
+        },
+      ],
+    });
+
+    if (typeof selected === 'string') {
+      setValue('tls_cert_path', selected);
+      trigger('tls_cert_path');
+    }
+  };
+
+  const handleBrowseKey = async () => {
+    if (!isCustomTls) return;
+    const selected = await open({
+      multiple: false,
+      filters: [
+        {
+          name: 'Private Key',
+          extensions: ['pem', 'key'],
+        },
+      ],
+    });
+
+    if (typeof selected === 'string') {
+      setValue('tls_key_path', selected);
+      trigger('tls_key_path');
+    }
+  };
 
   return (
     <div className="max-w-full mx-auto space-y-6">
@@ -241,9 +349,18 @@ const SettingsPage: React.FC = () => {
                 <h4 className="font-medium text-gray-900 dark:text-blue-50 mb-1 flex items-center gap-2">
                   <Globe className="h-4 w-4 text-blue-500 dark:text-blue-400" />
                   Current Server URL
+                  {isTlsEnabled ? (
+                    <Badge variant="success" className="text-xs">
+                      HTTPS
+                    </Badge>
+                  ) : (
+                    <Badge variant="secondary" className="text-xs">
+                      HTTP
+                    </Badge>
+                  )}
                 </h4>
                 <code className="block bg-blue-100 dark:bg-blue-900 px-2 py-1 rounded text-sm font-mono text-gray-900 dark:text-blue-50">
-                  http://{watchedValues.bind_address}:{watchedValues.port}
+                  {currentScheme}://{watchedValues.bind_address}:{watchedValues.port}
                 </code>
               </div>
             </CardContent>
@@ -306,6 +423,161 @@ const SettingsPage: React.FC = () => {
                   </Alert>
                 )}
               </div>
+            </CardContent>
+          </Card>
+
+          {/* TLS Configuration Card */}
+          <Card className="lg:col-span-2">
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2 text-lg">
+                <Lock className="h-4 w-4" />
+                TLS & Encryption
+              </CardTitle>
+              <CardDescription>
+                Serve the proxy over HTTPS with a self-signed or custom certificate
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div className="flex items-center justify-between p-3 border rounded-lg">
+                <div className="flex-1">
+                  <div className="flex items-center gap-2">
+                    <Label htmlFor="enable_tls">Enable TLS</Label>
+                    <Badge variant={isTlsEnabled ? 'success' : 'secondary'} className="text-xs">
+                      {isTlsEnabled ? 'Active' : 'Disabled'}
+                    </Badge>
+                  </div>
+                  <p className="text-sm text-muted-foreground mt-1">
+                    Terminate HTTPS connections at MaxProxy to protect API traffic on the network.
+                  </p>
+                </div>
+                <input
+                  id="enable_tls"
+                  type="checkbox"
+                  {...register('enable_tls')}
+                  className="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                />
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                <div className="space-y-2">
+                  <Label htmlFor="tls_mode">TLS Mode</Label>
+                  <select
+                    id="tls_mode"
+                    {...register('tls_mode')}
+                    disabled={!isTlsEnabled}
+                    className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                  >
+                    <option value="self_signed">Generate self-signed certificate</option>
+                    <option value="custom">Use custom certificate &amp; key</option>
+                  </select>
+                  <p className="text-xs text-muted-foreground">
+                    Self-signed certificates are stored in your MaxProxy data directory.
+                  </p>
+                </div>
+              </div>
+
+              {isTlsEnabled && watchedValues.tls_mode === 'self_signed' && (
+                <div className="bg-green-50 dark:bg-green-950 rounded-lg p-3 border border-green-200 dark:border-green-800">
+                  <h4 className="font-medium text-gray-900 dark:text-green-50 mb-1 flex items-center gap-2">
+                    <Shield className="h-4 w-4 text-green-500 dark:text-green-400" />
+                    Self-Signed Certificate
+                  </h4>
+                  <p className="text-xs text-gray-700 dark:text-green-100">
+                    A certificate/key pair will be generated automatically if it does not exist. Trust this certificate on any client that needs to verify HTTPS.
+                  </p>
+                  {(selfSignedCertPath || selfSignedKeyPath) && (
+                    <div className="mt-2 text-xs text-gray-700 dark:text-green-100 space-y-1">
+                      {selfSignedCertPath && (
+                        <div>
+                          <span className="font-medium">Certificate:</span>{' '}
+                          <code className="bg-green-100 dark:bg-green-900 px-1 rounded text-gray-900 dark:text-green-50">
+                            {selfSignedCertPath}
+                          </code>
+                        </div>
+                      )}
+                      {selfSignedKeyPath && (
+                        <div>
+                          <span className="font-medium">Private Key:</span>{' '}
+                          <code className="bg-green-100 dark:bg-green-900 px-1 rounded text-gray-900 dark:text-green-50">
+                            {selfSignedKeyPath}
+                          </code>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {isCustomTls && (
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                  <div className="space-y-2">
+                    <Label htmlFor="tls_cert_path" className="flex items-center gap-2">
+                      <Shield className="h-3 w-3" />
+                      Certificate File (.pem)
+                    </Label>
+                    <div className="flex items-center gap-2">
+                      <Input
+                        id="tls_cert_path"
+                        {...register('tls_cert_path')}
+                        disabled={!isCustomTls}
+                        placeholder="/path/to/certificate.pem"
+                        className={errors.tls_cert_path ? 'border-red-500' : ''}
+                      />
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        onClick={handleBrowseCert}
+                        disabled={!isCustomTls}
+                        className="flex items-center gap-1"
+                      >
+                        Browse
+                      </Button>
+                    </div>
+                    {errors.tls_cert_path && (
+                      <p className="text-sm text-red-600 dark:text-red-400">
+                        {errors.tls_cert_path.message}
+                      </p>
+                    )}
+                    <p className="text-xs text-muted-foreground">
+                      Provide the PEM-encoded server certificate chain.
+                    </p>
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="tls_key_path" className="flex items-center gap-2">
+                      <Key className="h-3 w-3" />
+                      Private Key File (.pem/.key)
+                    </Label>
+                    <div className="flex items-center gap-2">
+                      <Input
+                        id="tls_key_path"
+                        {...register('tls_key_path')}
+                        disabled={!isCustomTls}
+                        placeholder="/path/to/private.key"
+                        className={errors.tls_key_path ? 'border-red-500' : ''}
+                      />
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        onClick={handleBrowseKey}
+                        disabled={!isCustomTls}
+                        className="flex items-center gap-1"
+                      >
+                        Browse
+                      </Button>
+                    </div>
+                    {errors.tls_key_path && (
+                      <p className="text-sm text-red-600 dark:text-red-400">
+                        {errors.tls_key_path.message}
+                      </p>
+                    )}
+                    <p className="text-xs text-muted-foreground">
+                      Must match the certificate&apos;s private key (PEM, PKCS#8, or RSA).
+                    </p>
+                  </div>
+                </div>
+              )}
             </CardContent>
           </Card>
 

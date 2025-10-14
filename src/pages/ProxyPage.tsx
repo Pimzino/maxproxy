@@ -12,7 +12,8 @@ import {
   Globe,
   Zap,
   Activity,
-  Info
+  Info,
+  Lock
 } from 'lucide-react';
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -98,7 +99,8 @@ const ProxyPage: React.FC = () => {
   const getServerUrl = () => {
     if (!proxyConfig) return '';
     const host = proxyConfig.bind_address === '0.0.0.0' ? 'localhost' : proxyConfig.bind_address;
-    return `http://${host}:${proxyConfig.port}`;
+    const scheme = proxyConfig.enable_tls ? 'https' : 'http';
+    return `${scheme}://${host}:${proxyConfig.port}`;
   };
 
   const getStatusIcon = () => {
@@ -166,7 +168,7 @@ const ProxyPage: React.FC = () => {
           </CardHeader>
           <CardContent className="space-y-3">
             {proxyConfig && (
-              <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+              <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
                 <div className="space-y-1">
                   <div className="text-sm font-medium">Address</div>
                   <div className="flex items-center gap-2">
@@ -179,6 +181,25 @@ const ProxyPage: React.FC = () => {
                   <div className="flex items-center gap-2">
                     <Server className="h-4 w-4 text-muted-foreground" />
                     <span className="text-sm font-mono">{proxyConfig.port}</span>
+                  </div>
+                </div>
+                <div className="space-y-1">
+                  <div className="text-sm font-medium">Protocol</div>
+                  <div className="flex items-center gap-2">
+                    {proxyConfig.enable_tls ? (
+                      <>
+                        <Lock className="h-4 w-4 text-green-500" />
+                        <span className="text-sm text-green-700 dark:text-green-400">HTTPS</span>
+                        <Badge variant="outline" className="text-xs">
+                          {proxyConfig.tls_mode === 'self_signed' ? 'Self-signed' : 'Custom'}
+                        </Badge>
+                      </>
+                    ) : (
+                      <>
+                        <Globe className="h-4 w-4 text-muted-foreground" />
+                        <span className="text-sm text-gray-600 dark:text-gray-300">HTTP</span>
+                      </>
+                    )}
                   </div>
                 </div>
                 <div className="space-y-1">
@@ -329,6 +350,41 @@ const ProxyPage: React.FC = () => {
                   <div><strong>Model:</strong> <code className="bg-blue-100 dark:bg-blue-900 px-1 rounded text-gray-900 dark:text-blue-50">claude-sonnet-4-20250514</code></div>
                 </div>
               </div>
+              {proxyConfig.enable_tls && (
+                <div className="bg-green-50 dark:bg-green-950 rounded-lg p-3 border border-green-200 dark:border-green-800">
+                  <h4 className="font-medium text-gray-900 dark:text-green-50 mb-2 flex items-center gap-2">
+                    <Lock className="h-4 w-4 text-green-500 dark:text-green-400" />
+                    TLS Certificate Details
+                  </h4>
+                  <div className="space-y-1 text-sm text-gray-900 dark:text-green-50">
+                    <div>
+                      <strong>Mode:</strong>{' '}
+                      {proxyConfig.tls_mode === 'self_signed' ? 'Self-signed' : 'Custom'}
+                    </div>
+                    {proxyConfig.tls_cert_path && (
+                      <div>
+                        <strong>Certificate:</strong>{' '}
+                        <code className="bg-green-100 dark:bg-green-900 px-1 rounded text-gray-900 dark:text-green-50">
+                          {proxyConfig.tls_cert_path}
+                        </code>
+                      </div>
+                    )}
+                    {proxyConfig.tls_mode === 'custom' && proxyConfig.tls_key_path && (
+                      <div>
+                        <strong>Key:</strong>{' '}
+                        <code className="bg-green-100 dark:bg-green-900 px-1 rounded text-gray-900 dark:text-green-50">
+                          {proxyConfig.tls_key_path}
+                        </code>
+                      </div>
+                    )}
+                    {proxyConfig.tls_mode === 'self_signed' && (
+                      <div className="text-xs text-gray-700 dark:text-green-200">
+                        Trust this certificate on your client to avoid HTTPS warnings.
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
             </CardContent>
           </Card>
         )}
@@ -352,6 +408,15 @@ const ProxyPage: React.FC = () => {
               <li>• Requires an active Claude Pro or Claude Max subscription</li>
               <li>• Usage is subject to Anthropic's terms of service</li>
               <li>• Keep your authentication tokens secure</li>
+              {proxyConfig?.enable_tls && proxyConfig.tls_cert_path && (
+                <li>
+                  • HTTPS is enabled — trust the certificate at{' '}
+                  <code className="bg-amber-100 dark:bg-amber-900 px-1 rounded text-gray-900 dark:text-amber-50">
+                    {proxyConfig.tls_cert_path}
+                  </code>{' '}
+                  on any client that validates TLS.
+                </li>
+              )}
             </ul>
           </div>
         </CardContent>

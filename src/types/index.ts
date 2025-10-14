@@ -20,6 +20,8 @@ export interface InitStatus {
   error: string | null;
 }
 
+export type TlsMode = 'self_signed' | 'custom';
+
 export interface ProxyConfig {
   port: number;
   bind_address: string;
@@ -28,6 +30,10 @@ export interface ProxyConfig {
   start_minimized: boolean;
   auto_start_proxy: boolean;
   launch_on_startup: boolean;
+  enable_tls: boolean;
+  tls_mode: TlsMode;
+  tls_cert_path?: string | null;
+  tls_key_path?: string | null;
 }
 
 export type LogLevel = 'Error' | 'Warning' | 'Info' | 'Debug';

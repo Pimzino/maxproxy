@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use axum::{
     body::Body,
     http::{HeaderMap, Method, StatusCode, Uri},
@@ -6,9 +6,9 @@ use axum::{
     routing::{any, get, post},
     Json, Router,
 };
+use axum_server::tls_rustls::RustlsConfig;
 use chrono;
 use chrono::{Duration as ChronoDuration, Utc};
-use futures_util::StreamExt;
 use parking_lot::{Mutex, RwLock};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -16,6 +16,7 @@ use serde_json::{json, Value};
 use std::{
     collections::HashMap,
     net::SocketAddr,
+    path::Path,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -53,6 +54,19 @@ const ANTHROPIC_BETA: &str =
 const API_BASE: &str = "https://api.anthropic.com";
 const REQUEST_TIMEOUT: u64 = 120;
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TlsMode {
+    SelfSigned,
+    Custom,
+}
+
+impl Default for TlsMode {
+    fn default() -> Self {
+        Self::SelfSigned
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyConfig {
     pub port: u16,
@@ -65,6 +79,14 @@ pub struct ProxyConfig {
     pub auto_start_proxy: bool,
     #[serde(default)]
     pub launch_on_startup: bool,
+    #[serde(default)]
+    pub enable_tls: bool,
+    #[serde(default)]
+    pub tls_mode: TlsMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_cert_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_key_path: Option<String>,
 }
 
 impl Default for ProxyConfig {
@@ -77,6 +99,10 @@ impl Default for ProxyConfig {
             start_minimized: false,
             auto_start_proxy: false,
             launch_on_startup: false,
+            enable_tls: false,
+            tls_mode: TlsMode::SelfSigned,
+            tls_cert_path: None,
+            tls_key_path: None,
         }
     }
 }
@@ -415,14 +441,34 @@ pub struct ProxyServer {
 impl ProxyServer {
     pub fn new(token_storage: TokenStorage, oauth_manager: Arc<TokioMutex<OAuthManager>>) -> Self {
         // Load saved configuration or use defaults
-        let initial_config = token_storage
+        let mut initial_config = token_storage
             .load_config()
             .unwrap_or(None)
             .unwrap_or_else(ProxyConfig::default);
 
+        if initial_config.enable_tls && initial_config.tls_mode == TlsMode::SelfSigned {
+            match token_storage.ensure_self_signed_certificate() {
+                Ok((cert_path, key_path)) => {
+                    initial_config.tls_cert_path =
+                        Some(cert_path.to_string_lossy().to_string());
+                    initial_config.tls_key_path =
+                        Some(key_path.to_string_lossy().to_string());
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[ProxyServer] Failed to prepare self-signed certificate: {}. Falling back to HTTP.",
+                        e
+                    );
+                    initial_config.enable_tls = false;
+                }
+            }
+        }
+
+        let token_storage = Arc::new(token_storage);
+
         Self {
             config: Arc::new(RwLock::new(initial_config)),
-            token_storage: Arc::new(token_storage),
+            token_storage: token_storage.clone(),
             oauth_manager,
             client: Client::builder()
                 .timeout(Duration::from_secs(REQUEST_TIMEOUT))
@@ -443,7 +489,48 @@ impl ProxyServer {
         self.config.read().clone()
     }
 
-    pub fn update_config(&self, new_config: ProxyConfig) -> Result<()> {
+    pub fn update_config(&self, mut new_config: ProxyConfig) -> Result<()> {
+        // Normalize optional TLS fields
+        if matches!(new_config.tls_cert_path.as_ref(), Some(path) if path.trim().is_empty()) {
+            new_config.tls_cert_path = None;
+        }
+        if matches!(new_config.tls_key_path.as_ref(), Some(path) if path.trim().is_empty()) {
+            new_config.tls_key_path = None;
+        }
+
+        if new_config.enable_tls {
+            match new_config.tls_mode {
+                TlsMode::SelfSigned => {
+                    let (cert_path, key_path) = self.token_storage.ensure_self_signed_certificate()?;
+                    new_config.tls_cert_path = Some(cert_path.to_string_lossy().to_string());
+                    new_config.tls_key_path = Some(key_path.to_string_lossy().to_string());
+                }
+                TlsMode::Custom => {
+                    let cert_path = new_config
+                        .tls_cert_path
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("TLS certificate path is required for custom mode"))?;
+                    let key_path = new_config
+                        .tls_key_path
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("TLS private key path is required for custom mode"))?;
+
+                    if !Path::new(cert_path).exists() {
+                        return Err(anyhow!(
+                            "TLS certificate file not found at {}",
+                            cert_path
+                        ));
+                    }
+                    if !Path::new(key_path).exists() {
+                        return Err(anyhow!(
+                            "TLS private key file not found at {}",
+                            key_path
+                        ));
+                    }
+                }
+            }
+        }
+
         // Save configuration to file for persistence
         if let Err(e) = self.token_storage.save_config(&new_config) {
             // Log error but don't fail the operation
@@ -453,6 +540,26 @@ impl ProxyServer {
         let mut config = self.config.write();
         *config = new_config;
         Ok(())
+    }
+
+    async fn load_tls_config(&self, config: &ProxyConfig) -> Result<RustlsConfig> {
+        let cert_path = config
+            .tls_cert_path
+            .as_ref()
+            .ok_or_else(|| anyhow!("TLS certificate path is not configured"))?;
+        let key_path = config
+            .tls_key_path
+            .as_ref()
+            .ok_or_else(|| anyhow!("TLS private key path is not configured"))?;
+
+        RustlsConfig::from_pem_file(cert_path.as_str(), key_path.as_str())
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to load TLS certificate/key from {} and {}",
+                    cert_path, key_path
+                )
+            })
     }
 
     pub fn get_logs(&self) -> Vec<LogEntry> {
@@ -589,11 +696,38 @@ impl ProxyServer {
         let addr = format!("{}:{}", config.bind_address, config.port);
         let socket_addr: SocketAddr = addr.parse()?;
 
-        let listener = TcpListener::bind(&socket_addr).await?;
-        self.log_info(format!("Proxy server starting on {}", addr));
+        let tls_config = if config.enable_tls {
+            Some(self.load_tls_config(&config).await?)
+        } else {
+            None
+        };
 
-        // Build the router
-        let app = self.build_router();
+        let listener = if config.enable_tls {
+            None
+        } else {
+            Some(TcpListener::bind(&socket_addr).await?)
+        };
+
+        let scheme = if config.enable_tls { "https" } else { "http" };
+        self.log_info(format!("Proxy server starting on {}://{}", scheme, addr));
+        if config.enable_tls {
+            let mode_label = match config.tls_mode {
+                TlsMode::SelfSigned => "self-signed",
+                TlsMode::Custom => "custom",
+            };
+            if let Some(cert_path) = config.tls_cert_path.as_ref() {
+                self.log_info(format!(
+                    "TLS enabled ({}) with certificate: {}",
+                    mode_label, cert_path
+                ));
+            } else {
+                self.log_info(format!("TLS enabled ({})", mode_label));
+            }
+        }
+
+        let router = self.build_router();
+        let router_for_http = router.clone();
+        let router_for_tls = router;
 
         self.running.store(true, Ordering::Relaxed);
 
@@ -601,7 +735,17 @@ impl ProxyServer {
         let server_running = self.running.clone();
 
         let handle = tokio::spawn(async move {
-            if let Err(e) = axum::serve(listener, app).await {
+            let result = match (tls_config, listener) {
+                (Some(tls_config), _) => axum_server::bind_rustls(socket_addr, tls_config)
+                    .serve(router_for_tls.into_make_service())
+                    .await,
+                (None, Some(listener)) => {
+                    axum::serve(listener, router_for_http.into_make_service()).await
+                }
+                (None, None) => unreachable!("Server must have either TLS config or HTTP listener"),
+            };
+
+            if let Err(e) = result {
                 let mut logs = server_logs.lock();
                 logs.push(LogEntry {
                     level: LogLevel::Error,
@@ -2576,3 +2720,4 @@ fn sanitize_anthropic_request(request: &mut AnthropicMessageRequest) {
         request.temperature = Some(1.0);
     }
 }
+use futures_util::StreamExt;

@@ -1,9 +1,10 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::RwLock;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use crate::oauth::TokenResponse;
 use crate::proxy::ProxyConfig;
@@ -253,6 +254,72 @@ impl TokenStorage {
     /// Get the configuration file path
     pub fn get_config_file_path(&self) -> PathBuf {
         self.app_dir.join("config.json")
+    }
+
+    pub fn get_self_signed_certificate_paths(&self) -> (PathBuf, PathBuf) {
+        let tls_dir = self.app_dir.join("tls");
+        (tls_dir.join("selfsigned.crt"), tls_dir.join("selfsigned.key"))
+    }
+
+    pub fn ensure_self_signed_certificate(&self) -> Result<(PathBuf, PathBuf)> {
+        let tls_dir = self.app_dir.join("tls");
+        if !tls_dir.exists() {
+            fs::create_dir_all(&tls_dir)
+                .with_context(|| format!("Failed to create TLS directory at {:?}", tls_dir))?;
+        }
+
+        let (cert_path, key_path) = self.get_self_signed_certificate_paths();
+
+        if !cert_path.exists() || !key_path.exists() {
+            println!(
+                "[TokenStorage] Generating new self-signed certificate at {:?}",
+                tls_dir
+            );
+
+            let mut params =
+                rcgen::CertificateParams::new(vec!["localhost".to_string()]);
+            params
+                .subject_alt_names
+                .push(rcgen::SanType::IpAddress(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+            params
+                .subject_alt_names
+                .push(rcgen::SanType::IpAddress(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+            params
+                .subject_alt_names
+                .push(rcgen::SanType::DnsName("127.0.0.1".into()));
+            params
+                .subject_alt_names
+                .push(rcgen::SanType::DnsName("::1".into()));
+
+            let certificate = rcgen::Certificate::from_params(params)
+                .context("Failed to create certificate parameters")?;
+            let cert_pem = certificate
+                .serialize_pem()
+                .context("Failed to serialize certificate")?;
+            let key_pem = certificate.serialize_private_key_pem();
+
+            fs::write(&cert_path, cert_pem)
+                .with_context(|| format!("Failed to write certificate to {:?}", cert_path))?;
+            fs::write(&key_path, key_pem)
+                .with_context(|| format!("Failed to write private key to {:?}", key_path))?;
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(metadata) = fs::metadata(&key_path) {
+                    let mut permissions = metadata.permissions();
+                    permissions.set_mode(0o600);
+                    if let Err(e) = fs::set_permissions(&key_path, permissions) {
+                        eprintln!(
+                            "[TokenStorage] Failed to set private key permissions: {}",
+                            e
+                        );
+                    }
+                }
+            }
+        }
+
+        Ok((cert_path, key_path))
     }
 
     /// Save proxy configuration to file

@@ -27,8 +27,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.11", features = ["json", "stream"] }
 tokio = { version = "1", features = ["full"] }
-tokio-stream = "0.1"
 axum = { version = "0.7", features = ["ws"] }
+axum-server = { version = "0.6", features = ["tls-rustls"] }
 tower = "0.4"
 tower-http = { version = "0.5", features = ["cors", "fs"] }
 sha2 = "0.10"
@@ -45,3 +45,4 @@ urlencoding = "2.1"
 dirs = "5.0"
 bytes = "1.5"
 os_info = "3"
+rcgen = "0.11"
