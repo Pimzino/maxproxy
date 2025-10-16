@@ -44,6 +44,14 @@ export const updateProxyConfig = async (config: ProxyConfig): Promise<CommandRes
   return invoke('update_proxy_config', { config });
 };
 
+export const getAccessibleEndpoints = async (): Promise<CommandResult<string[]>> => {
+  return invoke('get_accessible_endpoints');
+};
+
+export const trustCertificate = async (): Promise<CommandResult<string>> => {
+  return invoke('trust_proxy_certificate');
+};
+
 // Logging API
 export const getLogs = async (): Promise<CommandResult<LogEntry[]>> => {
   return invoke('get_logs');

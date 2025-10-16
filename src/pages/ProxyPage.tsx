@@ -25,7 +25,8 @@ import {
   stopProxyServer,
   getProxyStatus,
   getProxyConfig,
-  getTokenStatus
+  getTokenStatus,
+  getAccessibleEndpoints
 } from '@/lib/api';
 
 const ProxyPage: React.FC = () => {
@@ -49,6 +50,11 @@ const ProxyPage: React.FC = () => {
     queryFn: getTokenStatus,
   });
 
+  const { data: accessibleEndpointsData, refetch: refetchEndpoints } = useQuery({
+    queryKey: ['accessibleEndpoints'],
+    queryFn: getAccessibleEndpoints,
+  });
+
   // Mutations
   const startServerMutation = useMutation({
     mutationFn: startProxyServer,
@@ -56,6 +62,7 @@ const ProxyPage: React.FC = () => {
       if (result.success) {
         setMessage({ type: 'success', text: 'Proxy server started successfully!' });
         refetchProxyStatus();
+        refetchEndpoints();
         refreshAppState();
       } else {
         setMessage({ type: 'error', text: result.error || 'Failed to start proxy server' });
@@ -69,6 +76,7 @@ const ProxyPage: React.FC = () => {
       if (result.success) {
         setMessage({ type: 'success', text: 'Proxy server stopped successfully!' });
         refetchProxyStatus();
+        refetchEndpoints();
         refreshAppState();
       } else {
         setMessage({ type: 'error', text: result.error || 'Failed to stop proxy server' });
@@ -80,6 +88,7 @@ const ProxyPage: React.FC = () => {
   const proxyConfig = proxyConfigData?.data ?? state.proxyConfig;
   const tokenStatus = tokenStatusData?.data ?? state.tokenStatus;
   const hasValidAuth = tokenStatus?.has_tokens && !tokenStatus?.is_expired;
+  const accessibleEndpoints = accessibleEndpointsData?.data ?? [];
 
   const handleStartServer = () => {
     setMessage(null);
@@ -96,12 +105,23 @@ const ProxyPage: React.FC = () => {
     setMessage({ type: 'info', text: 'Copied to clipboard!' });
   };
 
-  const getServerUrl = () => {
+  const computeFallbackEndpoint = () => {
     if (!proxyConfig) return '';
-    const host = proxyConfig.bind_address === '0.0.0.0' ? 'localhost' : proxyConfig.bind_address;
     const scheme = proxyConfig.enable_tls ? 'https' : 'http';
+    const host = proxyConfig.bind_address === '0.0.0.0' || proxyConfig.bind_address === '::'
+      ? 'localhost'
+      : proxyConfig.bind_address;
     return `${scheme}://${host}:${proxyConfig.port}`;
   };
+
+  const primaryEndpoint = accessibleEndpoints[0] ?? computeFallbackEndpoint();
+  const displayEndpoints = accessibleEndpoints.length > 0
+    ? accessibleEndpoints
+    : primaryEndpoint
+      ? [primaryEndpoint]
+      : [];
+
+  const getServerUrl = () => primaryEndpoint;
 
   const getStatusIcon = () => {
     if (proxyRunning) {
@@ -257,6 +277,31 @@ const ProxyPage: React.FC = () => {
                 </div>
               </div>
             )}
+            {displayEndpoints.length > 0 && (
+              <div className="mt-4 space-y-1">
+                <div className="text-sm font-medium">Available URLs</div>
+                <div className="flex flex-col gap-2 md:flex-row md:flex-wrap">
+                  {displayEndpoints.map((endpoint) => (
+                    <div key={endpoint} className="flex items-center gap-2">
+                      <code className="px-2 py-1 bg-muted rounded-md text-sm font-mono">
+                        {endpoint}
+                      </code>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => copyToClipboard(endpoint)}
+                        className="flex items-center gap-1"
+                      >
+                        <Copy className="h-3 w-3" />
+                      </Button>
+                    </div>
+                  ))}
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  Use any of the above addresses when connecting from other devices on your network.
+                </p>
+              </div>
+            )}
           </CardContent>
         </Card>
 
@@ -345,7 +390,19 @@ const ProxyPage: React.FC = () => {
                   Quick Setup
                 </h4>
                 <div className="space-y-1 text-sm text-gray-900 dark:text-blue-50">
-                  <div><strong>Base URL:</strong> <code className="bg-blue-100 dark:bg-blue-900 px-1 rounded text-gray-900 dark:text-blue-50">{getServerUrl()}</code></div>
+                  <div>
+                    <strong>Base URLs:</strong>
+                    <div className="mt-1 space-y-1">
+                      {displayEndpoints.map((endpoint) => (
+                          <code
+                            key={endpoint}
+                            className="bg-blue-100 dark:bg-blue-900 px-1 rounded text-gray-900 dark:text-blue-50 block"
+                          >
+                            {endpoint}
+                          </code>
+                        ))}
+                    </div>
+                  </div>
                   <div><strong>API Key:</strong> <code className="bg-blue-100 dark:bg-blue-900 px-1 rounded text-gray-900 dark:text-blue-50">dummy</code></div>
                   <div><strong>Model:</strong> <code className="bg-blue-100 dark:bg-blue-900 px-1 rounded text-gray-900 dark:text-blue-50">claude-sonnet-4-20250514</code></div>
                 </div>

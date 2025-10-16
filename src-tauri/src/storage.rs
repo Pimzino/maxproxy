@@ -261,7 +261,10 @@ impl TokenStorage {
         (tls_dir.join("selfsigned.crt"), tls_dir.join("selfsigned.key"))
     }
 
-    pub fn ensure_self_signed_certificate(&self) -> Result<(PathBuf, PathBuf)> {
+    pub fn ensure_self_signed_certificate(
+        &self,
+        config: Option<&ProxyConfig>,
+    ) -> Result<(PathBuf, PathBuf)> {
         let tls_dir = self.app_dir.join("tls");
         if !tls_dir.exists() {
             fs::create_dir_all(&tls_dir)
@@ -269,27 +272,116 @@ impl TokenStorage {
         }
 
         let (cert_path, key_path) = self.get_self_signed_certificate_paths();
+        let meta_path = tls_dir.join("selfsigned.meta.json");
 
-        if !cert_path.exists() || !key_path.exists() {
+        let mut dns_set: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        let mut ip_set: std::collections::BTreeSet<IpAddr> =
+            std::collections::BTreeSet::new();
+
+        dns_set.insert("localhost".to_string());
+        dns_set.insert("127.0.0.1".to_string());
+        dns_set.insert("::1".to_string());
+        ip_set.insert(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        ip_set.insert(IpAddr::V6(Ipv6Addr::LOCALHOST));
+
+        if let Some(cfg) = config {
+            let bind = cfg.bind_address.trim();
+            if !bind.is_empty() && bind != "0.0.0.0" && bind != "::" {
+                if let Ok(ip) = bind.parse::<IpAddr>() {
+                    if !ip.is_unspecified() {
+                        ip_set.insert(ip);
+                    }
+                } else {
+                    dns_set.insert(bind.to_string());
+                }
+            }
+        }
+
+        if let Ok(hostname) = hostname::get() {
+            if let Some(name) = hostname.to_str() {
+                dns_set.insert(name.to_string());
+            }
+        }
+
+        if let Ok(ifaces) = if_addrs::get_if_addrs() {
+            for iface in ifaces {
+                let ip = iface.ip();
+                if ip.is_loopback() || ip.is_unspecified() {
+                    continue;
+                }
+                if let IpAddr::V4(v4) = ip {
+                    if v4.is_link_local() {
+                        continue;
+                    }
+                }
+                if let IpAddr::V6(v6) = ip {
+                    if v6.is_unicast_link_local() {
+                        continue;
+                    }
+                }
+                ip_set.insert(ip);
+            }
+        }
+
+        #[derive(Serialize, Deserialize)]
+        struct SelfSignedMeta {
+            dns_names: Vec<String>,
+            ip_addrs: Vec<String>,
+        }
+
+        let desired_dns_vec: Vec<String> = dns_set.iter().cloned().collect();
+        let desired_ip_vec: Vec<String> = ip_set.iter().map(|ip| ip.to_string()).collect();
+        let desired_dns_set: std::collections::BTreeSet<String> =
+            desired_dns_vec.iter().cloned().collect();
+        let desired_ip_set: std::collections::BTreeSet<String> =
+            desired_ip_vec.iter().cloned().collect();
+
+        let desired_meta = SelfSignedMeta {
+            dns_names: desired_dns_vec,
+            ip_addrs: desired_ip_vec,
+        };
+
+        let mut needs_regenerate = true;
+        if cert_path.exists() && key_path.exists() && meta_path.exists() {
+            if let Ok(meta_json) = fs::read_to_string(&meta_path) {
+                if let Ok(existing_meta) = serde_json::from_str::<SelfSignedMeta>(&meta_json) {
+                    let existing_dns: std::collections::BTreeSet<String> =
+                        existing_meta.dns_names.into_iter().collect();
+                    let existing_ips: std::collections::BTreeSet<String> =
+                        existing_meta.ip_addrs.into_iter().collect();
+                    if existing_dns == desired_dns_set && existing_ips == desired_ip_set {
+                        needs_regenerate = false;
+                    }
+                }
+            }
+        }
+
+        if needs_regenerate {
             println!(
                 "[TokenStorage] Generating new self-signed certificate at {:?}",
                 tls_dir
             );
 
-            let mut params =
-                rcgen::CertificateParams::new(vec!["localhost".to_string()]);
+            let mut params = rcgen::CertificateParams::new(Vec::new());
             params
-                .subject_alt_names
-                .push(rcgen::SanType::IpAddress(IpAddr::V4(Ipv4Addr::LOCALHOST)));
-            params
-                .subject_alt_names
-                .push(rcgen::SanType::IpAddress(IpAddr::V6(Ipv6Addr::LOCALHOST)));
-            params
-                .subject_alt_names
-                .push(rcgen::SanType::DnsName("127.0.0.1".into()));
-            params
-                .subject_alt_names
-                .push(rcgen::SanType::DnsName("::1".into()));
+                .distinguished_name
+                .push(rcgen::DnType::CommonName, "MaxProxy Self-Signed");
+            params.subject_alt_names = dns_set
+                .iter()
+                .cloned()
+                .map(|name| rcgen::SanType::DnsName(name.into()))
+                .collect();
+            for ip in &ip_set {
+                params
+                    .subject_alt_names
+                    .push(rcgen::SanType::IpAddress(*ip));
+            }
+            if params.subject_alt_names.is_empty() {
+                params
+                    .subject_alt_names
+                    .push(rcgen::SanType::DnsName("localhost".into()));
+            }
 
             let certificate = rcgen::Certificate::from_params(params)
                 .context("Failed to create certificate parameters")?;
@@ -302,6 +394,10 @@ impl TokenStorage {
                 .with_context(|| format!("Failed to write certificate to {:?}", cert_path))?;
             fs::write(&key_path, key_pem)
                 .with_context(|| format!("Failed to write private key to {:?}", key_path))?;
+
+            let meta_json = serde_json::to_string_pretty(&desired_meta)?;
+            fs::write(&meta_path, meta_json)
+                .with_context(|| format!("Failed to write certificate metadata to {:?}", meta_path))?;
 
             #[cfg(unix)]
             {

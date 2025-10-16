@@ -7,6 +7,7 @@ use axum::{
     Json, Router,
 };
 use axum_server::tls_rustls::RustlsConfig;
+use if_addrs::get_if_addrs;
 use chrono;
 use chrono::{Duration as ChronoDuration, Utc};
 use parking_lot::{Mutex, RwLock};
@@ -14,9 +15,10 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
+    io::Cursor,
     net::SocketAddr,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -28,6 +30,8 @@ use tokio::sync::Mutex as TokioMutex;
 use tower::ServiceBuilder;
 use tower_http::cors::{Any, CorsLayer};
 use uuid::Uuid;
+use rustls::{Certificate, PrivateKey, ServerConfig};
+use rustls_pemfile::{certs, pkcs8_private_keys, rsa_private_keys};
 
 use crate::oauth::OAuthManager;
 use crate::storage::TokenStorage;
@@ -447,7 +451,7 @@ impl ProxyServer {
             .unwrap_or_else(ProxyConfig::default);
 
         if initial_config.enable_tls && initial_config.tls_mode == TlsMode::SelfSigned {
-            match token_storage.ensure_self_signed_certificate() {
+            match token_storage.ensure_self_signed_certificate(Some(&initial_config)) {
                 Ok((cert_path, key_path)) => {
                     initial_config.tls_cert_path =
                         Some(cert_path.to_string_lossy().to_string());
@@ -501,7 +505,9 @@ impl ProxyServer {
         if new_config.enable_tls {
             match new_config.tls_mode {
                 TlsMode::SelfSigned => {
-                    let (cert_path, key_path) = self.token_storage.ensure_self_signed_certificate()?;
+                    let (cert_path, key_path) = self
+                        .token_storage
+                        .ensure_self_signed_certificate(Some(&new_config))?;
                     new_config.tls_cert_path = Some(cert_path.to_string_lossy().to_string());
                     new_config.tls_key_path = Some(key_path.to_string_lossy().to_string());
                 }
@@ -552,14 +558,72 @@ impl ProxyServer {
             .as_ref()
             .ok_or_else(|| anyhow!("TLS private key path is not configured"))?;
 
-        RustlsConfig::from_pem_file(cert_path.as_str(), key_path.as_str())
+        let cert_bytes = tokio::fs::read(cert_path)
             .await
-            .with_context(|| {
-                format!(
-                    "Failed to load TLS certificate/key from {} and {}",
-                    cert_path, key_path
-                )
-            })
+            .with_context(|| format!("Failed to read TLS certificate at {}", cert_path))?;
+        let key_bytes = tokio::fs::read(key_path)
+            .await
+            .with_context(|| format!("Failed to read TLS private key at {}", key_path))?;
+
+        let mut cert_reader = Cursor::new(&cert_bytes);
+        let cert_chain = certs(&mut cert_reader)
+            .map_err(|e| anyhow!("Failed to parse TLS certificate: {}", e))?
+            .into_iter()
+            .map(Certificate)
+            .collect::<Vec<_>>();
+
+        if cert_chain.is_empty() {
+            return Err(anyhow!(
+                "No certificates found in TLS certificate file at {}",
+                cert_path
+            ));
+        }
+
+        let mut key_reader = Cursor::new(&key_bytes);
+        let mut keys = pkcs8_private_keys(&mut key_reader)
+            .map_err(|e| anyhow!("Failed to parse PKCS#8 private key: {}", e))?;
+
+        if keys.is_empty() {
+            let mut key_reader = Cursor::new(&key_bytes);
+            keys = rsa_private_keys(&mut key_reader)
+                .map_err(|e| anyhow!("Failed to parse RSA private key: {}", e))?;
+        }
+
+        if keys.is_empty() {
+            return Err(anyhow!(
+                "No usable private keys found in TLS key file at {}",
+                key_path
+            ));
+        }
+
+        let private_key = PrivateKey(keys.remove(0));
+
+        let mut server_config = ServerConfig::builder()
+            .with_cipher_suites(&[
+                rustls::cipher_suite::TLS13_AES_256_GCM_SHA384,
+                rustls::cipher_suite::TLS13_AES_128_GCM_SHA256,
+                rustls::cipher_suite::TLS13_CHACHA20_POLY1305_SHA256,
+                rustls::cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+                rustls::cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+                rustls::cipher_suite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+                rustls::cipher_suite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+            ])
+            .with_kx_groups(&[
+                &rustls::kx_group::X25519,
+                &rustls::kx_group::SECP384R1,
+                &rustls::kx_group::SECP256R1,
+            ])
+            .with_protocol_versions(&[
+                &rustls::version::TLS12,
+                &rustls::version::TLS13,
+            ])
+            .context("Failed to configure Rustls protocol versions")?
+            .with_no_client_auth()
+            .with_single_cert(cert_chain, private_key)?;
+
+        server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+
+        Ok(RustlsConfig::from_config(Arc::new(server_config)))
     }
 
     pub fn get_logs(&self) -> Vec<LogEntry> {
@@ -591,6 +655,149 @@ impl ProxyServer {
 
     fn log_info(&self, message: String) {
         self.log_with_level(LogLevel::Info, message);
+    }
+
+    fn compute_accessible_endpoints(config: &ProxyConfig) -> Vec<String> {
+        let scheme = if config.enable_tls { "https" } else { "http" };
+        let port = config.port;
+        let bind_address = config.bind_address.trim();
+
+        let mut endpoints: BTreeSet<String> = BTreeSet::new();
+
+        fn add_host(endpoints: &mut BTreeSet<String>, scheme: &str, port: u16, host: &str) {
+            if host.is_empty() {
+                return;
+            }
+            let needs_brackets = host.contains(':') && !host.starts_with('[');
+            let formatted = if needs_brackets {
+                format!("{}://[{}]:{}", scheme, host, port)
+            } else {
+                format!("{}://{}:{}", scheme, host, port)
+            };
+            endpoints.insert(formatted);
+        }
+
+        fn add_ip(endpoints: &mut BTreeSet<String>, scheme: &str, port: u16, ip: std::net::IpAddr) {
+            let formatted = match ip {
+                std::net::IpAddr::V4(v4) => format!("{}://{}:{}", scheme, v4, port),
+                std::net::IpAddr::V6(v6) => format!("{}://[{}]:{}", scheme, v6, port),
+            };
+            endpoints.insert(formatted);
+        }
+
+        let is_wildcard = bind_address == "0.0.0.0" || bind_address == "::";
+
+        if is_wildcard {
+            add_host(&mut endpoints, scheme, port, "localhost");
+            add_ip(
+                &mut endpoints,
+                scheme,
+                port,
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            );
+            add_ip(
+                &mut endpoints,
+                scheme,
+                port,
+                std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+            );
+
+            if let Ok(hostname) = hostname::get() {
+                if let Some(name) = hostname.to_str() {
+                    add_host(&mut endpoints, scheme, port, name);
+                }
+            }
+
+            if let Ok(ifaces) = get_if_addrs() {
+                for iface in ifaces {
+                    let ip = iface.ip();
+                    if ip.is_loopback() || ip.is_unspecified() {
+                        continue;
+                    }
+                    if let std::net::IpAddr::V4(v4) = ip {
+                        if v4.is_link_local() {
+                            continue;
+                        }
+                    }
+                    if let std::net::IpAddr::V6(v6) = ip {
+                        if v6.is_unicast_link_local() {
+                            continue;
+                        }
+                    }
+                    add_ip(&mut endpoints, scheme, port, ip);
+                }
+            }
+        } else {
+            if let Ok(ip) = bind_address.parse::<std::net::IpAddr>() {
+                add_ip(&mut endpoints, scheme, port, ip);
+            } else {
+                add_host(&mut endpoints, scheme, port, bind_address);
+            }
+            add_host(&mut endpoints, scheme, port, "localhost");
+            add_ip(
+                &mut endpoints,
+                scheme,
+                port,
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            );
+            add_ip(
+                &mut endpoints,
+                scheme,
+                port,
+                std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+            );
+        }
+
+        endpoints.into_iter().collect()
+    }
+
+    pub fn accessible_endpoints(&self) -> Vec<String> {
+        let config = self.get_config();
+        Self::compute_accessible_endpoints(&config)
+    }
+
+    pub fn get_certificate_path_for_trust(&self) -> Result<PathBuf> {
+        let config = self.get_config();
+        if !config.enable_tls {
+            return Err(anyhow!(
+                "TLS is currently disabled. Enable TLS before trusting the certificate."
+            ));
+        }
+
+        match config.tls_mode {
+            TlsMode::SelfSigned => {
+                let (cert_path, _) = self
+                    .token_storage
+                    .ensure_self_signed_certificate(Some(&config))?;
+                Ok(cert_path)
+            }
+            TlsMode::Custom => {
+                if let Some(path) = config.tls_cert_path {
+                    let path = PathBuf::from(path);
+                    if path.exists() {
+                        Ok(path)
+                    } else {
+                        Err(anyhow!(
+                            "Configured TLS certificate was not found at {}",
+                            path.display()
+                        ))
+                    }
+                } else {
+                    Err(anyhow!(
+                        "No certificate path configured for custom TLS mode"
+                    ))
+                }
+            }
+        }
+    }
+
+    pub fn trust_certificate(&self) -> Result<String> {
+        let cert_path = self.get_certificate_path_for_trust()?;
+        crate::cert::install_certificate(&cert_path)?;
+        Ok(format!(
+            "Certificate trusted successfully: {}",
+            cert_path.display()
+        ))
     }
 
     /// Cancel any scheduled token refresh task
@@ -722,6 +929,14 @@ impl ProxyServer {
                 ));
             } else {
                 self.log_info(format!("TLS enabled ({})", mode_label));
+            }
+        }
+
+        let endpoints_to_log = Self::compute_accessible_endpoints(&config);
+        if !endpoints_to_log.is_empty() {
+            self.log_info("Accessible endpoints:".to_string());
+            for entry in endpoints_to_log {
+                self.log_info(format!("  {}", entry));
             }
         }
 

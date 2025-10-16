@@ -17,7 +17,9 @@ import {
   PlayCircle,
   Power,
   Lock,
-  Key
+  Key,
+  ShieldCheck,
+  Loader2
 } from 'lucide-react';
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -26,7 +28,7 @@ import { Label } from '@/components/ui/label';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Badge } from '@/components/ui/badge';
 import { useAppContext } from '@/contexts/AppContext';
-import { getProxyConfig, updateProxyConfig, getProxyStatus, getSystemInfo } from '@/lib/api';
+import { getProxyConfig, updateProxyConfig, getProxyStatus, getSystemInfo, getAccessibleEndpoints, trustCertificate } from '@/lib/api';
 import { ProxyConfig, SystemInfo } from '@/types';
 import { open } from '@tauri-apps/plugin-dialog';
 
@@ -108,6 +110,11 @@ const SettingsPage: React.FC = () => {
     queryFn: getProxyStatus,
   });
 
+  const { data: accessibleEndpointsData, refetch: refetchEndpoints } = useQuery({
+    queryKey: ['accessibleEndpoints'],
+    queryFn: getAccessibleEndpoints,
+  });
+
   // Mutations
   const updateConfigMutation = useMutation({
     mutationFn: (config: ProxyConfig) => updateProxyConfig(config),
@@ -115,6 +122,7 @@ const SettingsPage: React.FC = () => {
       if (result.success) {
         setMessage({ type: 'success', text: 'Configuration updated successfully!' });
         refetchConfig();
+        refetchEndpoints();
         refreshAppState();
       } else {
         setMessage({ type: 'error', text: result.error || 'Failed to update configuration' });
@@ -122,8 +130,21 @@ const SettingsPage: React.FC = () => {
     },
   });
 
+  const trustCertificateMutation = useMutation({
+    mutationFn: () => trustCertificate(),
+    onSuccess: (result) => {
+      if (result.success) {
+        setMessage({ type: 'success', text: result.data || 'Certificate trusted successfully.' });
+      } else {
+        setMessage({ type: 'error', text: result.error || 'Failed to trust certificate' });
+      }
+    },
+  });
+
   const currentConfig = configData?.data ?? state.proxyConfig;
   const serverRunning = statusData?.data ?? state.proxyRunning;
+  const accessibleEndpoints = accessibleEndpointsData?.data ?? [];
+  const isTlsConfigured = currentConfig?.enable_tls ?? false;
 
   useEffect(() => {
     (async () => {
@@ -219,6 +240,10 @@ const SettingsPage: React.FC = () => {
 
   const watchedValues = watch();
   const currentScheme = watchedValues.enable_tls ? 'https' : 'http';
+  const bindAddressValue = watchedValues.bind_address || '0.0.0.0';
+  const portValue = watchedValues.port || 0;
+  const fallbackEndpoint = `${currentScheme}://${bindAddressValue}:${portValue}`;
+  const exampleEndpoints = Array.from(new Set(accessibleEndpoints.length > 0 ? accessibleEndpoints : [fallbackEndpoint]));
   const isTlsEnabled = watchedValues.enable_tls;
   const isCustomTls = isTlsEnabled && watchedValues.tls_mode === 'custom';
   const selfSignedCertPath =
@@ -348,7 +373,7 @@ const SettingsPage: React.FC = () => {
               <div className="bg-blue-50 dark:bg-blue-950 rounded-lg p-3 border border-blue-200 dark:border-blue-800">
                 <h4 className="font-medium text-gray-900 dark:text-blue-50 mb-1 flex items-center gap-2">
                   <Globe className="h-4 w-4 text-blue-500 dark:text-blue-400" />
-                  Current Server URL
+                  Available Server URLs
                   {isTlsEnabled ? (
                     <Badge variant="success" className="text-xs">
                       HTTPS
@@ -359,9 +384,21 @@ const SettingsPage: React.FC = () => {
                     </Badge>
                   )}
                 </h4>
-                <code className="block bg-blue-100 dark:bg-blue-900 px-2 py-1 rounded text-sm font-mono text-gray-900 dark:text-blue-50">
-                  {currentScheme}://{watchedValues.bind_address}:{watchedValues.port}
-                </code>
+                <div className="space-y-1">
+                  {exampleEndpoints.map((endpoint) => (
+                    <code
+                      key={endpoint}
+                      className="block bg-blue-100 dark:bg-blue-900 px-2 py-1 rounded text-sm font-mono text-gray-900 dark:text-blue-50"
+                    >
+                      {endpoint}
+                    </code>
+                  ))}
+                  {accessibleEndpoints.length === 0 && (
+                    <p className="text-xs text-muted-foreground">
+                      Additional network addresses will update after saving.
+                    </p>
+                  )}
+                </div>
               </div>
             </CardContent>
           </Card>
@@ -576,6 +613,28 @@ const SettingsPage: React.FC = () => {
                       Must match the certificate&apos;s private key (PEM, PKCS#8, or RSA).
                     </p>
                   </div>
+                </div>
+              )}
+
+              {isTlsConfigured && (
+                <div className="flex flex-col sm:flex-row sm:items-center gap-2 pt-1">
+                  <Button
+                    type="button"
+                    size="sm"
+                    onClick={() => trustCertificateMutation.mutate()}
+                    disabled={trustCertificateMutation.isPending}
+                    className="flex items-center gap-2"
+                  >
+                    {trustCertificateMutation.isPending ? (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <ShieldCheck className="h-4 w-4" />
+                    )}
+                    Trust Certificate
+                  </Button>
+                  <p className="text-xs text-muted-foreground">
+                    A system prompt may appear requesting administrator approval.
+                  </p>
                 </div>
               )}
             </CardContent>

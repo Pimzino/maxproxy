@@ -16,6 +16,7 @@ use tokio::sync::Mutex;
 mod oauth;
 mod proxy;
 mod storage;
+mod cert;
 
 use oauth::OAuthManager;
 use proxy::{LogEntry, ProxyConfig, ProxyServer};
@@ -431,6 +432,25 @@ async fn update_proxy_config(
     Ok(CommandResult::success(()))
 }
 
+#[tauri::command]
+async fn trust_proxy_certificate(
+    state: tauri::State<'_, AppState>,
+) -> Result<CommandResult<String>, tauri::Error> {
+    match state.proxy_server.trust_certificate() {
+        Ok(message) => Ok(CommandResult::success(message)),
+        Err(e) => Ok(CommandResult::error(e.to_string())),
+    }
+}
+
+#[tauri::command]
+async fn get_accessible_endpoints(
+    state: tauri::State<'_, AppState>,
+) -> Result<CommandResult<Vec<String>>, tauri::Error> {
+    Ok(CommandResult::success(
+        state.proxy_server.accessible_endpoints(),
+    ))
+}
+
 // Logging Commands
 #[tauri::command]
 async fn get_logs(
@@ -509,6 +529,8 @@ pub fn run() {
             get_proxy_status,
             get_proxy_config,
             update_proxy_config,
+            trust_proxy_certificate,
+            get_accessible_endpoints,
             get_logs,
             clear_logs,
             get_init_status,
