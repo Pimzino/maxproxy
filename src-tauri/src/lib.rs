@@ -13,6 +13,7 @@ use tauri::{
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt as AutostartManagerExt};
 use tokio::sync::Mutex;
 
+mod logging;
 mod oauth;
 mod proxy;
 mod storage;
@@ -83,29 +84,29 @@ impl TrayMenuState {
 
     fn set_proxy_running(&self, running: bool) {
         if let Err(e) = self.start_proxy_item.set_enabled(!running) {
-            eprintln!("[Tray] Failed to update start item state: {}", e);
+            log_error!("Failed to update start item state: {}", e);
         }
 
         if let Err(e) = self.stop_proxy_item.set_enabled(running) {
-            eprintln!("[Tray] Failed to update stop item state: {}", e);
+            log_error!("Failed to update stop item state: {}", e);
         }
     }
 
     fn set_preferences(&self, config: &ProxyConfig) {
         if let Err(e) = self.start_minimized_item.set_checked(config.start_minimized) {
-            eprintln!("[Tray] Failed to update start minimized toggle: {}", e);
+            log_warn!("[Tray] Failed to update start minimized toggle: {}", e);
         }
         if let Err(e) = self
             .auto_start_proxy_item
             .set_checked(config.auto_start_proxy)
         {
-            eprintln!("[Tray] Failed to update auto start proxy toggle: {}", e);
+            log_warn!("[Tray] Failed to update auto start proxy toggle: {}", e);
         }
         if let Err(e) = self
             .launch_on_startup_item
             .set_checked(config.launch_on_startup)
         {
-            eprintln!("[Tray] Failed to update launch on startup toggle: {}", e);
+            log_warn!("[Tray] Failed to update launch on startup toggle: {}", e);
         }
     }
 
@@ -117,7 +118,7 @@ impl TrayMenuState {
         };
 
         if let Err(e) = self.toggle_window_item.set_text(label) {
-            eprintln!("[Tray] Failed to update window toggle label: {}", e);
+            log_warn!("[Tray] Failed to update window toggle label: {}", e);
         }
     }
 }
@@ -196,20 +197,17 @@ async fn initialize_tokens_with_auto_renewal(
         error: None,
     };
 
-    println!("[TokenInit] Starting token initialization and auto-renewal check...");
+    log_info!("Starting token initialization and auto-renewal check...");
 
     // Check if tokens exist and their status
     match token_storage.get_status() {
         Ok(token_status) => {
             status.tokens_checked = true;
-            println!(
-                "[TokenInit] Token status checked - has_tokens: {}, is_expired: {}",
-                token_status.has_tokens, token_status.is_expired
-            );
+            log_info!("Token status checked - has_tokens: {}, is_expired: {}", token_status.has_tokens, token_status.is_expired);
 
             // If we have tokens and they're expired, try to refresh them
             if token_status.has_tokens && token_status.is_expired {
-                println!("[TokenInit] Tokens are expired, attempting automatic renewal...");
+                log_info!("Tokens are expired, attempting automatic renewal...");
                 status.token_refresh_attempted = true;
 
                 match token_storage.get_refresh_token() {
@@ -226,19 +224,19 @@ async fn initialize_tokens_with_auto_renewal(
                                 match token_storage.save_tokens(&new_tokens) {
                                     Ok(_) => {
                                         status.token_refresh_successful = true;
-                                        println!("[TokenInit] ✓ Token renewal successful! Application ready.");
+                                        log_info!("✓ Token renewal successful! Application ready.");
                                     }
                                     Err(e) => {
                                         let error_msg =
                                             format!("Failed to save refreshed tokens: {}", e);
-                                        println!("[TokenInit] ✗ {}", error_msg);
+                                        log_error!("{}", error_msg);
                                         status.error = Some(error_msg);
                                     }
                                 }
                             }
                             Err(e) => {
                                 let error_msg = format!("All token refresh attempts failed: {}", e);
-                                println!("[TokenInit] ✗ {}", error_msg);
+                                log_error!("{}", error_msg);
                                 status.error = Some(error_msg);
                             }
                         }
@@ -246,30 +244,30 @@ async fn initialize_tokens_with_auto_renewal(
                     Ok(None) => {
                         let error_msg =
                             "No refresh token available for automatic renewal".to_string();
-                        println!("[TokenInit] ✗ {}", error_msg);
+                        log_error!("{}", error_msg);
                         status.error = Some(error_msg);
                     }
                     Err(e) => {
                         let error_msg = format!("Failed to retrieve refresh token: {}", e);
-                        println!("[TokenInit] ✗ {}", error_msg);
+                        log_error!("{}", error_msg);
                         status.error = Some(error_msg);
                     }
                 }
             } else if token_status.has_tokens && !token_status.is_expired {
-                println!("[TokenInit] ✓ Valid tokens found, no renewal needed.");
+                log_info!("✓ Valid tokens found, no renewal needed.");
             } else {
-                println!("[TokenInit] ℹ No tokens found, user will need to authenticate.");
+                log_info!("ℹ No tokens found, user will need to authenticate.");
             }
         }
         Err(e) => {
             let error_msg = format!("Failed to check token status: {}", e);
-            println!("[TokenInit] ✗ {}", error_msg);
+            log_error!("{}", error_msg);
             status.error = Some(error_msg);
         }
     }
 
     status.initialization_complete = true;
-    println!("[TokenInit] Token initialization complete.");
+    log_info!("Token initialization complete.");
     status
 }
 
@@ -477,14 +475,14 @@ async fn get_init_status(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Initialize application state
-    println!("[App] Initializing MaxProxy application...");
+    log_info!("Initializing MaxProxy application...");
     let token_storage = match TokenStorage::new() {
         Ok(storage) => {
-            println!("[App] ✓ Token storage initialized successfully");
+            log_info!("✓ Token storage initialized successfully");
             storage
         }
         Err(e) => {
-            eprintln!("[App] ✗ Failed to initialize token storage: {}", e);
+            log_error!("✗ Failed to initialize token storage: {}", e);
             std::process::exit(1);
         }
     };
@@ -544,15 +542,23 @@ pub fn run() {
             if let Some(main_window) = app.get_webview_window("main") {
                 let allow_quit_flag = app.state::<AppState>().allow_quit.clone();
                 let app_handle_for_event = app_handle.clone();
-                let window_clone = main_window.clone();
 
                 main_window.on_window_event(move |event| {
                     if let WindowEvent::CloseRequested { api, .. } = event {
                         if !allow_quit_flag.load(Ordering::Relaxed) {
                             api.prevent_close();
-                            if let Err(e) = window_clone.hide() {
-                                eprintln!("[Tray] Failed to hide window: {}", e);
-                            }
+
+                            let app_handle_clone = app_handle_for_event.clone();
+                            tauri::async_runtime::spawn(async move {
+                                if let Some(window) = app_handle_clone.get_webview_window("main") {
+                                    if matches!(window.is_visible(), Ok(true)) {
+                                        if let Err(e) = window.hide() {
+                                            eprintln!("[Tray] Failed to hide window: {}", e);
+                                        }
+                                    }
+                                }
+                            });
+
                             update_tray_window_state(&app_handle_for_event, false);
                         }
                     }
@@ -594,11 +600,11 @@ pub fn run() {
 
             #[cfg(debug_assertions)]
             {
-                let webview_window = app.get_webview_window("main").unwrap();
-                webview_window.open_devtools();
+                if let Some(webview_window) = app.get_webview_window("main") {
+                    webview_window.open_devtools();
 
-                // Disable WebView2 caching in development mode
-                webview_window
+                    // Disable WebView2 caching in development mode
+                    webview_window
                     .eval(
                         r#"
                     console.log('🚫 Disabling WebView2 caching for development...');
@@ -667,11 +673,17 @@ pub fn run() {
                     "#,
                     )
                     .ok();
+                } else {
+                    eprintln!("Warning: Could not get main webview window for devtools");
+                }
             }
             Ok(())
         })
         .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .unwrap_or_else(|e| {
+            eprintln!("Critical error while running tauri application: {}", e);
+            panic!("Failed to run tauri application: {}", e);
+        });
 }
 
 fn setup_system_tray(app: &tauri::App) -> tauri::Result<()> {

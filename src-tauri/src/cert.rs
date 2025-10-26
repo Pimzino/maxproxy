@@ -101,28 +101,28 @@ fn install_certificate_linux(cert_path: &Path) -> Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(anyhow!(
             "pkexec was not found. Please install the certificate manually using your distribution's tools."
         )),
-        Err(e) => Err(anyhow!("Failed to execute pkexec: {}", e)),
+        Err(e) => Err(anyhow!("Failed to execute pkexec: {}. Please ensure you have the necessary permissions to install certificates.", e)),
     }
 }
 
 #[cfg(not(target_os = "windows"))]
 fn install_certificate_windows(_cert_path: &Path) -> Result<()> {
     Err(anyhow!(
-        "Automatic certificate installation is only implemented for Windows, macOS, and Linux."
+        "Automatic certificate installation is only implemented for Windows, macOS, and Linux. Please install the certificate manually on your platform."
     ))
 }
 
 #[cfg(not(target_os = "macos"))]
 fn install_certificate_macos(_cert_path: &Path) -> Result<()> {
     Err(anyhow!(
-        "Automatic certificate installation is only implemented for Windows, macOS, and Linux."
+        "Automatic certificate installation is only implemented for Windows, macOS, and Linux. Please install the certificate manually on your platform."
     ))
 }
 
 #[cfg(not(target_os = "linux"))]
 fn install_certificate_linux(_cert_path: &Path) -> Result<()> {
     Err(anyhow!(
-        "Automatic certificate installation is only implemented for Windows, macOS, and Linux."
+        "Automatic certificate installation is only implemented for Windows, macOS, and Linux. Please install the certificate manually on your platform."
     ))
 }
 
@@ -139,4 +139,3 @@ pub fn install_certificate(cert_path: &Path) -> Result<()> {
         ))
     }
 }
-

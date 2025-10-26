@@ -8,6 +8,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use crate::oauth::TokenResponse;
 use crate::proxy::ProxyConfig;
+use crate::{log_error, log_info};
 
 const APP_DIR: &str = ".maxproxy";
 
@@ -37,31 +38,28 @@ pub struct TokenStorage {
 impl TokenStorage {
     pub fn new() -> Result<Self> {
         let home_dir =
-            dirs::home_dir().ok_or_else(|| anyhow!("Could not determine home directory"))?;
+            dirs::home_dir().ok_or_else(|| anyhow!("Could not determine home directory. Please ensure your system has a valid home directory configured."))?;
 
         let app_dir = home_dir.join(APP_DIR);
 
         // Ensure the app directory exists
         if !app_dir.exists() {
             fs::create_dir_all(&app_dir)?;
-            println!("[TokenStorage] Created app directory: {:?}", app_dir);
+            log_info!("Created app directory: {:?}", app_dir);
         }
 
-        println!("[TokenStorage] Using storage directory: {:?}", app_dir);
+        log_info!("Using storage directory: {:?}", app_dir);
 
         Ok(Self { app_dir, cache: RwLock::new(None) })
     }
 
     /// Save tokens to file
     pub fn save_tokens(&self, token_response: &TokenResponse) -> Result<()> {
-        println!("[TokenStorage] Attempting to save tokens...");
-        println!(
-            "[TokenStorage] Token expires in: {} seconds",
-            token_response.expires_in
-        );
+        log_info!("Attempting to save tokens...");
+        log_info!("Token expires in: {} seconds", token_response.expires_in);
 
         let expires_at = Utc::now() + Duration::seconds(token_response.expires_in as i64);
-        println!("[TokenStorage] Token will expire at: {}", expires_at);
+        log_info!("Token will expire at: {}", expires_at);
 
         let stored_token = StoredToken {
             access_token: token_response.access_token.clone(),
@@ -73,11 +71,11 @@ impl TokenStorage {
         let token_file = self.get_token_file_path();
         let token_json = serde_json::to_string_pretty(&stored_token)?;
 
-        println!("[TokenStorage] Saving to file: {:?}", token_file);
+        log_info!("Saving to file: {:?}", token_file);
 
         match fs::write(&token_file, &token_json) {
             Ok(_) => {
-                println!("[TokenStorage] V Successfully saved tokens to file");
+                log_info!("V Successfully saved tokens to file");
                 // Update cache with latest tokens
                 if let Ok(mut guard) = self.cache.write() {
                     *guard = Some(stored_token);
@@ -85,7 +83,7 @@ impl TokenStorage {
                 Ok(())
             }
             Err(e) => {
-                println!("[TokenStorage] ? Failed to save tokens to file: {}", e);
+                log_error!("? Failed to save tokens to file: {}", e);
                 Err(anyhow!("Failed to save tokens to file: {}", e))
             }
         }
@@ -102,34 +100,25 @@ impl TokenStorage {
 
         let token_file = self.get_token_file_path();
 
-        println!(
-            "[TokenStorage] Attempting to load tokens from: {:?}",
-            token_file
-        );
+        log_info!("Attempting to load tokens from: {:?}", token_file);
 
         if !token_file.exists() {
-            println!("[TokenStorage] ? No token file found");
+            log_info!("? No token file found");
             return Ok(None);
         }
 
         match fs::read_to_string(&token_file) {
             Ok(token_json) => {
-                println!(
-                    "[TokenStorage] V Successfully read token file (length: {} chars)",
-                    token_json.len()
-                );
+                log_info!("V Successfully read token file (length: {} chars)", token_json.len());
 
                 match serde_json::from_str::<StoredToken>(&token_json) {
                     Ok(stored_token) => {
                         let now = Utc::now();
                         let is_expired = now >= stored_token.expires_at;
-                        println!("[TokenStorage] V Successfully parsed token data");
-                        println!(
-                            "[TokenStorage] Token expires at: {}",
-                            stored_token.expires_at
-                        );
-                        println!("[TokenStorage] Current time: {}", now);
-                        println!("[TokenStorage] Token expired: {}", is_expired);
+                        log_info!("V Successfully parsed token data");
+                        log_info!("Token expires at: {}", stored_token.expires_at);
+                        log_info!("Current time: {}", now);
+                        log_info!("Token expired: {}", is_expired);
                         // Populate cache
                         if let Ok(mut guard) = self.cache.write() {
                             *guard = Some(stored_token.clone());
@@ -137,13 +126,13 @@ impl TokenStorage {
                         Ok(Some(stored_token))
                     }
                     Err(e) => {
-                        println!("[TokenStorage] ? Failed to parse token data: {}", e);
+                        log_error!("? Failed to parse token data: {}", e);
                         Err(anyhow!("Failed to parse token data: {}", e))
                     }
                 }
             }
             Err(e) => {
-                println!("[TokenStorage] ? Failed to read token file: {}", e);
+                log_error!("? Failed to read token file: {}", e);
                 Err(anyhow!("Failed to read token file: {}", e))
             }
         }
@@ -152,27 +141,24 @@ impl TokenStorage {
     /// Clear stored tokens
     pub fn clear_tokens(&self) -> Result<()> {
         let token_file = self.get_token_file_path();
-        println!(
-            "[TokenStorage] Attempting to clear tokens from: {:?}",
-            token_file
-        );
+        log_info!("Attempting to clear tokens from: {:?}", token_file);
 
         if token_file.exists() {
             match fs::remove_file(&token_file) {
                 Ok(_) => {
-                    println!("[TokenStorage] V Successfully cleared token file");
+                    log_info!("V Successfully cleared token file");
                     if let Ok(mut guard) = self.cache.write() {
                         *guard = None;
                     }
                     Ok(())
                 }
                 Err(e) => {
-                    println!("[TokenStorage] ? Failed to clear token file: {}", e);
+                    log_error!("? Failed to clear token file: {}", e);
                     Err(anyhow!("Failed to clear token file: {}", e))
                 }
             }
         } else {
-            println!("[TokenStorage] ? No token file to clear");
+            log_info!("? No token file to clear");
             if let Ok(mut guard) = self.cache.write() {
                 *guard = None;
             }
@@ -358,10 +344,7 @@ impl TokenStorage {
         }
 
         if needs_regenerate {
-            println!(
-                "[TokenStorage] Generating new self-signed certificate at {:?}",
-                tls_dir
-            );
+            log_info!("Generating new self-signed certificate at {:?}", tls_dir);
 
             let mut params = rcgen::CertificateParams::new(Vec::new());
             params
@@ -406,10 +389,7 @@ impl TokenStorage {
                     let mut permissions = metadata.permissions();
                     permissions.set_mode(0o600);
                     if let Err(e) = fs::set_permissions(&key_path, permissions) {
-                        eprintln!(
-                            "[TokenStorage] Failed to set private key permissions: {}",
-                            e
-                        );
+                        log_error!("Failed to set private key permissions: {}", e);
                     }
                 }
             }
@@ -423,7 +403,7 @@ impl TokenStorage {
         let config_file = self.get_config_file_path();
         let config_json = serde_json::to_string_pretty(config)?;
         fs::write(&config_file, config_json)?;
-        println!("[TokenStorage] V Saved configuration to: {:?}", config_file);
+        log_info!("V Saved configuration to: {:?}", config_file);
         Ok(())
     }
 
@@ -438,10 +418,7 @@ impl TokenStorage {
         match fs::read_to_string(&config_file) {
             Ok(content) => {
                 let config: ProxyConfig = serde_json::from_str(&content)?;
-                println!(
-                    "[TokenStorage] V Loaded configuration from: {:?}",
-                    config_file
-                );
+                log_info!("V Loaded configuration from: {:?}", config_file);
                 Ok(Some(config))
             }
             Err(e) => Err(anyhow!("Failed to load configuration: {}", e)),

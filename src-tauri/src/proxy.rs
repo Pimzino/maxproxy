@@ -28,6 +28,8 @@ use std::{
 use tokio::net::TcpListener;
 use tokio::sync::Mutex as TokioMutex;
 use tower::ServiceBuilder;
+
+use crate::{log_debug, log_error};
 use tower_http::cors::{Any, CorsLayer};
 use uuid::Uuid;
 use rustls::{Certificate, PrivateKey, ServerConfig};
@@ -148,6 +150,10 @@ pub struct AnthropicMessageRequest {
     pub tools: Option<Vec<Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_sequences: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Value>,
 }
 
 // OpenAI API Types
@@ -329,6 +335,8 @@ pub struct OpenAIRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f32>,
@@ -419,7 +427,7 @@ pub struct OpenAIModel {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_length: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_completion_tokens: Option<u32>,
+    pub max_output_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<serde_json::Value>,
 }
@@ -428,6 +436,13 @@ pub struct OpenAIModel {
 pub struct OpenAIModelsResponse {
     pub object: String,
     pub data: Vec<OpenAIModel>,
+}
+
+#[derive(Debug, Clone)]
+struct ModelMetadata {
+    context_length: u32,
+    max_output_tokens: u32,
+    capabilities: serde_json::Value,
 }
 
 #[derive(Debug)]
@@ -448,7 +463,7 @@ impl ProxyServer {
         let mut initial_config = token_storage
             .load_config()
             .unwrap_or(None)
-            .unwrap_or_else(ProxyConfig::default);
+            .unwrap_or_else(|| ProxyConfig::default());
 
         if initial_config.enable_tls && initial_config.tls_mode == TlsMode::SelfSigned {
             match token_storage.ensure_self_signed_certificate(Some(&initial_config)) {
@@ -477,7 +492,10 @@ impl ProxyServer {
             client: Client::builder()
                 .timeout(Duration::from_secs(REQUEST_TIMEOUT))
                 .build()
-                .expect("Failed to create HTTP client"),
+                .unwrap_or_else(|e| {
+                    eprintln!("Critical error: Failed to create HTTP client: {}", e);
+                    panic!("Failed to create HTTP client: {}", e);
+                }),
             running: Arc::new(AtomicBool::new(false)),
             server_handle: Arc::new(Mutex::new(None)),
             token_refresh_task: Arc::new(Mutex::new(None)),
@@ -494,6 +512,15 @@ impl ProxyServer {
     }
 
     pub fn update_config(&self, mut new_config: ProxyConfig) -> Result<()> {
+        // Validate port
+        if new_config.port == 0 {
+            return Err(anyhow!("Port cannot be 0. Please provide a valid port number (1-65535)."));
+        }
+
+        // Validate bind_address
+        if new_config.bind_address.is_empty() {
+            return Err(anyhow!("Bind address cannot be empty. Please provide a valid IP address or hostname."));
+        }
         // Normalize optional TLS fields
         if matches!(new_config.tls_cert_path.as_ref(), Some(path) if path.trim().is_empty()) {
             new_config.tls_cert_path = None;
@@ -515,11 +542,20 @@ impl ProxyServer {
                     let cert_path = new_config
                         .tls_cert_path
                         .as_ref()
-                        .ok_or_else(|| anyhow!("TLS certificate path is required for custom mode"))?;
+                        .ok_or_else(|| anyhow!("TLS certificate path is required for custom mode. Please provide a valid certificate file path."))?;
                     let key_path = new_config
                         .tls_key_path
                         .as_ref()
-                        .ok_or_else(|| anyhow!("TLS private key path is required for custom mode"))?;
+                        .ok_or_else(|| anyhow!("TLS private key path is required for custom mode. Please provide a valid private key file path."))?;
+
+                    // Validate that paths are not empty
+                    if cert_path.trim().is_empty() {
+                        return Err(anyhow!("TLS certificate path cannot be empty. Please provide a valid certificate file path."));
+                    }
+                    
+                    if key_path.trim().is_empty() {
+                        return Err(anyhow!("TLS private key path cannot be empty. Please provide a valid private key file path."));
+                    }
 
                     if !Path::new(cert_path).exists() {
                         return Err(anyhow!(
@@ -552,11 +588,11 @@ impl ProxyServer {
         let cert_path = config
             .tls_cert_path
             .as_ref()
-            .ok_or_else(|| anyhow!("TLS certificate path is not configured"))?;
+            .ok_or_else(|| anyhow!("TLS certificate path is not configured. Please configure a valid certificate file path."))?;
         let key_path = config
             .tls_key_path
             .as_ref()
-            .ok_or_else(|| anyhow!("TLS private key path is not configured"))?;
+            .ok_or_else(|| anyhow!("TLS private key path is not configured. Please configure a valid private key file path."))?;
 
         let cert_bytes = tokio::fs::read(cert_path)
             .await
@@ -567,7 +603,7 @@ impl ProxyServer {
 
         let mut cert_reader = Cursor::new(&cert_bytes);
         let cert_chain = certs(&mut cert_reader)
-            .map_err(|e| anyhow!("Failed to parse TLS certificate: {}", e))?
+            .map_err(|e| anyhow!("Failed to parse TLS certificate: {}. Please ensure the certificate file is valid and in PEM format.", e))?
             .into_iter()
             .map(Certificate)
             .collect::<Vec<_>>();
@@ -581,12 +617,12 @@ impl ProxyServer {
 
         let mut key_reader = Cursor::new(&key_bytes);
         let mut keys = pkcs8_private_keys(&mut key_reader)
-            .map_err(|e| anyhow!("Failed to parse PKCS#8 private key: {}", e))?;
+            .map_err(|e| anyhow!("Failed to parse PKCS#8 private key: {}. Please ensure the private key file is valid and in PEM format.", e))?;
 
         if keys.is_empty() {
             let mut key_reader = Cursor::new(&key_bytes);
             keys = rsa_private_keys(&mut key_reader)
-                .map_err(|e| anyhow!("Failed to parse RSA private key: {}", e))?;
+                .map_err(|e| anyhow!("Failed to parse RSA private key: {}. Please ensure the private key file is valid and in PEM format.", e))?;
         }
 
         if keys.is_empty() {
@@ -896,7 +932,7 @@ impl ProxyServer {
 
     pub async fn start(&self) -> Result<()> {
         if self.running.load(Ordering::Relaxed) {
-            return Err(anyhow!("Server is already running"));
+            return Err(anyhow!("Server is already running. Please stop the server before starting it again."));
         }
 
         let config = self.get_config();
@@ -979,7 +1015,7 @@ impl ProxyServer {
 
     pub async fn stop(&self) -> Result<()> {
         if !self.running.load(Ordering::Relaxed) {
-            return Err(anyhow!("Server is not running"));
+            return Err(anyhow!("Server is not running. Please start the server before attempting to stop it."));
         }
 
         self.running.store(false, Ordering::Relaxed);
@@ -1138,19 +1174,25 @@ impl ProxyState {
 }
 
 // Get model metadata including context length and capabilities
-fn get_model_metadata(model_id: &str) -> (u32, u32, serde_json::Value) {
+fn get_model_metadata(model_id: &str) -> ModelMetadata {
     let base_model = get_base_model_name(model_id);
 
     // Context length and max completion tokens based on model
-    let (context_length, max_completion_tokens) = match base_model.as_str() {
+    let (context_length, max_output_tokens) = match base_model.as_str() {
         "claude-opus-4-1-20250805" => (200000, 8192),
         "claude-opus-4-20250514" => (200000, 8192),
+        "claude-sonnet-4-5-20250929" => {
+            // Sonnet 4.5 supports extended context with beta header
+            (200000, 64000) // Standard context, can be up to 1M with beta
+        }
         "claude-sonnet-4-20250514" => {
             // Sonnet 4 supports extended context with beta header
             (200000, 8192) // Standard context, can be up to 1M with beta
         }
-        "claude-3-7-sonnet-20250219" => (200000, 8192),
-        "claude-3-5-haiku-20241022" => (200000, 4096),
+        "claude-haiku-4-5-20251015" => {
+            // Haiku 4.5 - first Haiku with extended thinking and 64K output
+            (200000, 64000) // Standard context, 1M available
+        }
         "claude-3-haiku-20240307" => (200000, 4096),
         _ => (200000, 4096), // Default for unknown models
     };
@@ -1180,8 +1222,10 @@ fn get_model_metadata(model_id: &str) -> (u32, u32, serde_json::Value) {
         }
     }
 
-    // Extended context support for Sonnet 4
-    if base_model == "claude-sonnet-4-20250514" {
+    // Extended context support for Sonnet 4.5, Sonnet 4, and Haiku 4.5
+    if base_model == "claude-sonnet-4-5-20250929"
+        || base_model == "claude-sonnet-4-20250514"
+        || base_model == "claude-haiku-4-5-20251015" {
         capabilities.insert(
             "extended_context".to_string(),
             serde_json::Value::Bool(true),
@@ -1192,11 +1236,11 @@ fn get_model_metadata(model_id: &str) -> (u32, u32, serde_json::Value) {
         );
     }
 
-    (
+    ModelMetadata {
         context_length,
-        max_completion_tokens,
-        serde_json::Value::Object(capabilities),
-    )
+        max_output_tokens,
+        capabilities: serde_json::Value::Object(capabilities),
+    }
 }
 
 async fn handle_models(
@@ -1211,9 +1255,9 @@ async fn handle_models(
         // Standard Anthropic models
         "claude-opus-4-1-20250805",
         "claude-opus-4-20250514",
+        "claude-sonnet-4-5-20250929",
         "claude-sonnet-4-20250514",
-        "claude-3-7-sonnet-20250219",
-        "claude-3-5-haiku-20241022",
+        "claude-haiku-4-5-20251015",
         "claude-3-haiku-20240307",
         // Thinking variants for Claude Opus 4.1
         "claude-opus-4-1-20250805-thinking-low",
@@ -1223,20 +1267,28 @@ async fn handle_models(
         "claude-opus-4-20250514-thinking-low",
         "claude-opus-4-20250514-thinking-medium",
         "claude-opus-4-20250514-thinking-high",
+        // Thinking variants for Claude Sonnet 4.5
+        "claude-sonnet-4-5-20250929-thinking-low",
+        "claude-sonnet-4-5-20250929-thinking-medium",
+        "claude-sonnet-4-5-20250929-thinking-high",
         // Thinking variants for Claude Sonnet 4
         "claude-sonnet-4-20250514-thinking-low",
         "claude-sonnet-4-20250514-thinking-medium",
         "claude-sonnet-4-20250514-thinking-high",
-        // Thinking variants for Claude Sonnet 3.7
-        "claude-3-7-sonnet-20250219-thinking-low",
-        "claude-3-7-sonnet-20250219-thinking-medium",
-        "claude-3-7-sonnet-20250219-thinking-high",
+        // Thinking variants for Claude Haiku 4.5
+        "claude-haiku-4-5-20251015-thinking-low",
+        "claude-haiku-4-5-20251015-thinking-medium",
+        "claude-haiku-4-5-20251015-thinking-high",
     ];
 
     let models = model_ids
         .into_iter()
         .map(|id| {
-            let (context_length, max_completion_tokens, capabilities) = get_model_metadata(id);
+            let ModelMetadata {
+                context_length,
+                max_output_tokens,
+                capabilities,
+            } = get_model_metadata(id);
 
             OpenAIModel {
                 id: id.to_string(),
@@ -1244,7 +1296,7 @@ async fn handle_models(
                 created: 1687882411,
                 owned_by: "anthropic".to_string(),
                 context_length: Some(context_length),
-                max_completion_tokens: Some(max_completion_tokens),
+                max_output_tokens: Some(max_output_tokens),
                 capabilities: Some(capabilities),
             }
         })
@@ -1353,7 +1405,10 @@ async fn handle_messages(
             .header("Cache-Control", "no-cache")
             .header("Connection", "keep-alive")
             .body(body)
-            .unwrap())
+            .map_err(|e| {
+                log_error!("Failed to build streaming response: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?)
     } else {
         // Handle non-streaming response
         let response_text = response.text().await.unwrap_or_default();
@@ -1362,7 +1417,10 @@ async fn handle_messages(
             .status(status.as_u16())
             .header("Content-Type", "application/json")
             .body(Body::from(response_text))
-            .unwrap())
+            .map_err(|e| {
+                log_error!("Failed to build non-streaming response: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?)
     }
 }
 
@@ -1416,12 +1474,15 @@ impl StreamingTransformState {
                 }
             });
 
-            Some(format!(
-                "data: {}
+            let usage_chunk_str = match serde_json::to_string(&usage_chunk) {
+                Ok(json) => json,
+                Err(e) => {
+                    log_error!("Failed to serialize usage chunk: {}", e);
+                    return None;
+                }
+            };
 
-",
-                serde_json::to_string(&usage_chunk).unwrap()
-            ))
+            Some(format!("data: {}\n\n", usage_chunk_str))
         } else {
             None
         }
@@ -1517,10 +1578,7 @@ fn transform_anthropic_streaming_chunk(
                                 .unwrap_or(0) as u32;
                             state.set_input_tokens(input_tokens);
 
-                            println!(
-                                "[{}] [DEBUG] Stored input_tokens from message_start: {}",
-                                request_id, input_tokens
-                            );
+                            log_debug!("Stored input_tokens from message_start: {}", input_tokens);
                         }
                     }
                 }
@@ -1788,10 +1846,7 @@ fn transform_anthropic_streaming_chunk(
                                 as u32;
                             state.set_final_output_tokens(output_tokens);
 
-                            println!(
-                                "[{}] [DEBUG] Stored final output_tokens from message_delta: {}",
-                                request_id, output_tokens
-                            );
+                            log_debug!("Stored final output_tokens from message_delta: {}", output_tokens);
                         }
                     }
                 }
@@ -1801,20 +1856,11 @@ fn transform_anthropic_streaming_chunk(
                             state.create_usage_chunk(request_id, original_model, created)
                         {
                             openai_chunks.push(usage_chunk);
-                            println!("[{}] [DEBUG] Emitted final complete usage chunk at stream end (include_usage=true)", request_id);
-                            println!(
-                                "[{}] [DEBUG] Final usage: prompt={}, completion={}, total={}",
-                                request_id,
-                                state.input_tokens,
-                                state.output_tokens,
-                                state.input_tokens + state.output_tokens
-                            );
+                            log_debug!("Emitted final complete usage chunk at stream end (include_usage=true)");
+                            log_debug!("Final usage: prompt={}, completion={}, total={}", state.input_tokens, state.output_tokens, state.input_tokens + state.output_tokens);
                         }
                     } else {
-                        println!(
-                            "[{}] [DEBUG] Usage chunk NOT emitted (include_usage=false)",
-                            request_id
-                        );
+                        log_debug!("Usage chunk NOT emitted (include_usage=false)");
                     }
 
                     openai_chunks.push(
@@ -1837,7 +1883,7 @@ fn transform_anthropic_streaming_chunk(
 async fn handle_openai_chat_impl(
     axum::extract::State(state): axum::extract::State<ProxyState>,
     headers: HeaderMap,
-    Json(openai_request): Json<OpenAIRequest>,
+    Json(mut openai_request): Json<OpenAIRequest>,
 ) -> Result<Response, StatusCode> {
     let openai_compatible = {
         let config = state.config.read();
@@ -1899,8 +1945,118 @@ async fn handle_openai_chat_impl(
         }
     }
 
+    let ModelMetadata {
+        context_length: _,
+        max_output_tokens,
+        capabilities: _,
+    } = get_model_metadata(&openai_request.model);
+
+    if let Some(n) = openai_request.n {
+        if n > 1 {
+            state.log_warning(format!(
+                "[{}] Rejecting request with unsupported n value: {}",
+                request_id, n
+            ));
+            return Ok(openai_invalid_request_response(
+                "This OpenAI-compatible proxy only supports n=1 completions",
+                Some("n"),
+                Some("unsupported_feature"),
+            ));
+        }
+    }
+
+    if let Some(freq) = openai_request.frequency_penalty {
+        if freq != 0.0 {
+            state.log_warning(format!(
+                "[{}] Rejecting request with unsupported frequency_penalty: {}",
+                request_id, freq
+            ));
+            return Ok(openai_invalid_request_response(
+                "frequency_penalty is not supported for Anthropic-backed models",
+                Some("frequency_penalty"),
+                Some("unsupported_feature"),
+            ));
+        }
+    }
+
+    if let Some(presence) = openai_request.presence_penalty {
+        if presence != 0.0 {
+            state.log_warning(format!(
+                "[{}] Rejecting request with unsupported presence_penalty: {}",
+                request_id, presence
+            ));
+            return Ok(openai_invalid_request_response(
+                "presence_penalty is not supported for Anthropic-backed models",
+                Some("presence_penalty"),
+                Some("unsupported_feature"),
+            ));
+        }
+    }
+
+    let requested_max = openai_request
+        .max_output_tokens
+        .or(openai_request.max_tokens);
+    let resolved_max_tokens = match requested_max {
+        Some(0) => {
+            state.log_warning(format!(
+                "[{}] Rejecting request with max_tokens=0",
+                request_id
+            ));
+            return Ok(openai_invalid_request_response(
+                "max_tokens must be greater than zero",
+                Some("max_tokens"),
+                Some("invalid_request_error"),
+            ));
+        }
+        Some(value) if value > max_output_tokens => {
+            state.log_warning(format!(
+                "[{}] Rejecting request exceeding max_output_tokens ({} > {})",
+                request_id, value, max_output_tokens
+            ));
+            return Ok(openai_invalid_request_response(
+                &format!(
+                    "Requested max_tokens {} exceeds this model's max_output_tokens {}",
+                    value, max_output_tokens
+                ),
+                Some("max_tokens"),
+                Some("max_output_tokens_exceeded"),
+            ));
+        }
+        Some(value) => value,
+        None => std::cmp::min(max_output_tokens, 4096),
+    };
+    openai_request.max_tokens = Some(resolved_max_tokens);
+    openai_request.max_output_tokens = Some(resolved_max_tokens);
+    state.log_debug(format!(
+        "[{}] Using max_tokens={} (model max_output_tokens={})",
+        request_id, resolved_max_tokens, max_output_tokens
+    ));
+
+    let mut stop_sequences = openai_request.stop.as_ref().map(|stop| match stop {
+        OpenAIStop::Single(value) => vec![value.clone()],
+        OpenAIStop::Multiple(values) => values.clone(),
+    }).map(|mut seqs| {
+        seqs.retain(|s| !s.is_empty());
+        if seqs.len() > 4 {
+            seqs.truncate(4);
+        }
+        seqs
+    });
+    if let Some(seqs) = stop_sequences.as_ref() {
+        if seqs.is_empty() {
+            stop_sequences = None;
+        }
+    }
+    if let Some(seqs) = stop_sequences.as_ref() {
+        state.log_debug(format!(
+            "[{}] Normalized stop_sequences: {:?}",
+            request_id, seqs
+        ));
+    }
+
     // Transform OpenAI request to Anthropic format
-    let mut anthropic_request = transform_openai_to_anthropic(&openai_request);
+    let mut anthropic_request =
+        transform_openai_to_anthropic(&openai_request, stop_sequences);
 
     // Get access token
     let access_token = match state.get_valid_access_token(&request_id).await {
@@ -2155,7 +2311,10 @@ async fn handle_openai_chat_impl(
             .body(Body::from(
                 serde_json::to_string(&openai_error).unwrap_or_else(|_| error_text),
             ))
-            .unwrap());
+            .map_err(|e| {
+                log_error!("Failed to build error response: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?);
     }
 
     if openai_request.stream.unwrap_or(false) {
@@ -2287,7 +2446,10 @@ async fn handle_openai_chat_impl(
             state.log_debug(format!("[{}] [DEBUG]   {}: {}", request_id, name, value));
         }
 
-        Ok(response_builder.body(body).unwrap())
+        Ok(response_builder.body(body).map_err(|e| {
+                log_error!("Failed to build OpenAI streaming response: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?)
     } else {
         // Transform non-streaming response to OpenAI format
         let response_text = response.text().await.unwrap_or_default();
@@ -2312,8 +2474,7 @@ async fn handle_openai_chat_impl(
                         ));
 
                         // Debug log the transformed usage
-                        println!("[{}] [DEBUG] Transformed OpenAI response usage: prompt={}, completion={}, total={}",
-                            request_id,
+                        log_debug!("Transformed OpenAI response usage: prompt={}, completion={}, total={}",
                             openai_response.usage.prompt_tokens,
                             openai_response.usage.completion_tokens,
                             openai_response.usage.total_tokens
@@ -2361,9 +2522,20 @@ async fn handle_openai_chat_impl(
                             ));
                         }
 
+                        let response_body = match serde_json::to_string(&openai_response) {
+                            Ok(json) => json,
+                            Err(e) => {
+                                log_error!("Failed to serialize OpenAI response: {}", e);
+                                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+                            }
+                        };
+
                         Ok(response_builder
-                            .body(Body::from(serde_json::to_string(&openai_response).unwrap()))
-                            .unwrap())
+                            .body(Body::from(response_body))
+                            .map_err(|e| {
+                                log_error!("Failed to build OpenAI response: {}", e);
+                                StatusCode::INTERNAL_SERVER_ERROR
+                            })?)
                     }
                     Err(e) => {
                         state.log_error(format!("[{}] Transform error: {}", request_id, e));
@@ -2423,8 +2595,9 @@ fn supports_thinking(anthropic_model: &str) -> bool {
         anthropic_model,
         "claude-opus-4-1-20250805"
             | "claude-opus-4-20250514"
+            | "claude-sonnet-4-5-20250929"
             | "claude-sonnet-4-20250514"
-            | "claude-3-7-sonnet-20250219"
+            | "claude-haiku-4-5-20251015"
     )
 }
 
@@ -2471,7 +2644,10 @@ fn transform_openai_tools_to_anthropic(openai_request: &OpenAIRequest) -> Option
 }
 
 // Transform OpenAI request to Anthropic request
-fn transform_openai_to_anthropic(openai_request: &OpenAIRequest) -> AnthropicMessageRequest {
+fn transform_openai_to_anthropic(
+    openai_request: &OpenAIRequest,
+    stop_sequences: Option<Vec<String>>,
+) -> AnthropicMessageRequest {
     // Convert messages
     let mut anthropic_messages = Vec::new();
     let mut system_messages = Vec::new();
@@ -2597,6 +2773,11 @@ fn transform_openai_to_anthropic(openai_request: &OpenAIRequest) -> AnthropicMes
         .as_ref()
         .and_then(map_openai_tool_choice);
 
+    let metadata = openai_request
+        .user
+        .as_ref()
+        .map(|user| json!({ "user_id": user, "source": "maxproxy-openai-compat" }));
+
     AnthropicMessageRequest {
         model: base_model,
         messages: anthropic_messages,
@@ -2617,6 +2798,8 @@ fn transform_openai_to_anthropic(openai_request: &OpenAIRequest) -> AnthropicMes
         thinking,
         tools: anthropic_tools,
         tool_choice: anthropic_tool_choice,
+        stop_sequences,
+        metadata,
     }
 }
 
@@ -2710,9 +2893,7 @@ fn transform_anthropic_to_openai(
         .and_then(|t| t.as_u64())
         .unwrap_or(0) as u32;
 
-    println!(
-        "[{}] [DEBUG] Non-streaming response usage: prompt={}, completion={}, total={}",
-        request_id,
+    log_debug!("Non-streaming response usage: prompt={}, completion={}, total={}",
         prompt_tokens,
         completion_tokens,
         prompt_tokens + completion_tokens
@@ -2799,6 +2980,37 @@ fn transform_anthropic_error_to_openai(anthropic_error: &Value) -> Value {
             }
         })
     }
+}
+
+fn openai_invalid_request_response(
+    message: &str,
+    param: Option<&str>,
+    code: Option<&str>,
+) -> Response {
+    let mut error_payload = serde_json::Map::new();
+    error_payload.insert("message".to_string(), Value::String(message.to_string()));
+    error_payload.insert(
+        "type".to_string(),
+        Value::String("invalid_request_error".to_string()),
+    );
+    error_payload.insert(
+        "param".to_string(),
+        param
+            .map(|p| Value::String(p.to_string()))
+            .unwrap_or(Value::Null),
+    );
+    error_payload.insert(
+        "code".to_string(),
+        code.map(|c| Value::String(c.to_string()))
+            .unwrap_or(Value::Null),
+    );
+
+    let mut root = serde_json::Map::new();
+    root.insert("error".to_string(), Value::Object(error_payload));
+
+    let body = Value::Object(root);
+
+    (StatusCode::BAD_REQUEST, Json(body)).into_response()
 }
 
 fn parse_function_arguments(arguments: &str) -> Value {
@@ -2910,6 +3122,49 @@ fn count_cache_control_blocks(request: &AnthropicMessageRequest) -> usize {
     total
 }
 
+fn sanitize_content_value(value: &mut Value) -> bool {
+    match value {
+        Value::Array(items) => {
+            items.retain_mut(|item| sanitize_content_value(item));
+            !items.is_empty()
+        }
+        Value::Object(map) => {
+            let is_text_block = matches!(
+                map.get("type").and_then(|v| v.as_str()),
+                Some("text") | None
+            );
+
+            if is_text_block {
+                map.get("text")
+                    .and_then(|t| t.as_str())
+                    .map(|text| !text.trim().is_empty())
+                    .unwrap_or(false)
+            } else {
+                if let Some(content_value) = map.get_mut("content") {
+                    if !sanitize_content_value(content_value) {
+                        return false;
+                    }
+                }
+                true
+            }
+        }
+        Value::String(text) => !text.trim().is_empty(),
+        Value::Null => false,
+        _ => true,
+    }
+}
+
+fn sanitize_message_value(message: &mut Value) -> bool {
+    if let Value::Object(map) = message {
+        if let Some(content) = map.get_mut("content") {
+            if !sanitize_content_value(content) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 fn sanitize_anthropic_request(request: &mut AnthropicMessageRequest) {
     // Universal parameter validation - clean invalid values
     if let Some(top_p) = request.top_p {
@@ -2934,5 +3189,14 @@ fn sanitize_anthropic_request(request: &mut AnthropicMessageRequest) {
     if request.thinking.is_some() {
         request.temperature = Some(1.0);
     }
+
+    if let Some(system_messages) = &mut request.system {
+        system_messages.retain_mut(|message| sanitize_content_value(message));
+        if system_messages.is_empty() {
+            request.system = None;
+        }
+    }
+
+    request.messages.retain_mut(|message| sanitize_message_value(message));
 }
 use futures_util::StreamExt;

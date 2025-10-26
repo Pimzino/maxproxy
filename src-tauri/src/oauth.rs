@@ -8,6 +8,8 @@ use std::time::Duration;
 use url::Url;
 use webbrowser;
 
+use crate::{log_error, log_info};
+
 // OAuth configuration constants (from ccmaxproxy settings)
 const AUTH_BASE_AUTHORIZE: &str = "https://claude.ai";
 const AUTH_BASE_TOKEN: &str = "https://console.anthropic.com";
@@ -101,7 +103,7 @@ impl OAuthManager {
 
         // Open the authorization URL in the default browser
         if let Err(e) = webbrowser::open(&auth_url) {
-            eprintln!("Failed to open browser: {}", e);
+            log_error!("Failed to open browser: {}", e);
             // Return URL anyway so user can manually open it
         }
 
@@ -113,11 +115,11 @@ impl OAuthManager {
         let pkce_params = self
             .pkce_params
             .as_ref()
-            .ok_or_else(|| anyhow!("No PKCE parameters available. Call start_login_flow first."))?;
+            .ok_or_else(|| anyhow!("No PKCE parameters available. Please start the OAuth login flow first."))?;
 
         // Split the code and state (they come as "code#state")
         let parts: Vec<&str> = code.split('#').collect();
-        let actual_code = parts.get(0).ok_or_else(|| anyhow!("Invalid code format"))?;
+        let actual_code = parts.get(0).ok_or_else(|| anyhow!("Invalid code format received from OAuth provider"))?;
         let received_state = parts.get(1).copied().unwrap_or(&pkce_params.state);
 
         // Verify state
@@ -227,28 +229,22 @@ impl OAuthManager {
         let mut last_error = None;
 
         for attempt in 1..=max_retries {
-            println!(
-                "[OAuth] Attempting token refresh (attempt {}/{})",
-                attempt, max_retries
-            );
+            log_info!("Attempting token refresh (attempt {}/{})", attempt, max_retries);
 
             match self.refresh_token(refresh_token).await {
                 Ok(token_response) => {
-                    println!("[OAuth] ✓ Token refresh successful on attempt {}", attempt);
+                    log_info!("✓ Token refresh successful on attempt {}", attempt);
                     return Ok(token_response);
                 }
                 Err(e) => {
                     let error_msg = e.to_string();
-                    println!(
-                        "[OAuth] ✗ Token refresh failed on attempt {}: {}",
-                        attempt, error_msg
-                    );
+                    log_error!("✗ Token refresh failed on attempt {}: {}", attempt, error_msg);
                     last_error = Some(e);
 
                     // If this isn't the last attempt, wait before retrying
                     if attempt < max_retries {
                         let delay_seconds = 2_u64.pow(attempt as u32 - 1); // Exponential backoff: 1s, 2s, 4s...
-                        println!("[OAuth] Waiting {} seconds before retry...", delay_seconds);
+                        log_info!("Waiting {} seconds before retry...", delay_seconds);
                         tokio::time::sleep(Duration::from_secs(delay_seconds)).await;
                     }
                 }
@@ -256,11 +252,8 @@ impl OAuthManager {
         }
 
         let final_error = last_error
-            .unwrap_or_else(|| anyhow!("Token refresh failed after {} attempts", max_retries));
-        println!(
-            "[OAuth] ✗ All token refresh attempts failed. Final error: {}",
-            final_error
-        );
+            .unwrap_or_else(|| anyhow!("Token refresh failed after {} attempts. Please try again or re-authenticate.", max_retries));
+        log_error!("✗ All token refresh attempts failed. Final error: {}", final_error);
         Err(final_error)
     }
 }
